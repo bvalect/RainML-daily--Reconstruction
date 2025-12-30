@@ -1,0 +1,370 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import os
+import sys
+import joblib
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, Bidirectional, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import Adam
+import warnings
+warnings.filterwarnings('ignore')
+# --- CONFIGURATION ---
+# Define paths
+EXCEL_FILE_PATH = "data/dados_Torre2012_2024hourlyV5.xlsx"
+BASE_PATH = "data/2_3_Hourly_LSTM/LSTM_24"
+# --- LOAD AND MERGE ERA5 DATA ---
+ERA5_PATH = "data/dados_ERA5_2012_2024hourly.xlsx"
+
+OUT_DIR = os.path.join(BASE_PATH, "LSTM_24")
+# Create output directory if it doesn't exist
+os.makedirs(OUT_DIR, exist_ok=True)
+# Dates
+TRAIN_START = '2018-01-01'
+TRAIN_END = '2022-09-30'
+FULL_START = '2013-01-01'
+FULL_END = '2023-09-30'
+# Model Parameters
+INPUT_WIDTH = 15 * 24  # 720 hours (15 days)
+LABEL_WIDTH = 1        # Predict next hour
+SHIFT = 1              # Predict next step
+BATCH_SIZE = 32
+EPOCHS = 50
+PATIENCE = 10
+# Random Seed
+tf.random.set_seed(42)
+np.random.seed(42)
+# --- METRIC FUNCTIONS ---
+def calculate_kge(y_true, y_pred):
+    """Kling-Gupta Efficiency"""
+    if len(y_true) < 2: return -np.inf
+    r = np.corrcoef(y_true, y_pred)[0, 1]
+    alpha = np.std(y_pred) / (np.std(y_true) + 1e-6)
+    beta = np.mean(y_pred) / (np.mean(y_true) + 1e-6)
+    kge = 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+    return kge
+def calculate_crmse(y_true, y_pred):
+    """Centered RMSE (for Taylor Diagram)"""
+    return np.sqrt(np.mean(((y_pred - np.mean(y_pred)) - (y_true - np.mean(y_true)))**2))
+def calculate_metrics(y_true, y_pred):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    
+    if np.std(y_true) == 0 or np.std(y_pred) == 0:
+        r = 0
+        kge = -np.inf
+    else:
+        r = np.corrcoef(y_true.flatten(), y_pred.flatten())[0, 1]
+        kge = calculate_kge(y_true.flatten(), y_pred.flatten())
+        
+    std_obs = np.std(y_true)
+    std_pred = np.std(y_pred)
+    crmse = calculate_crmse(y_true.flatten(), y_pred.flatten())
+    
+    return {
+        "RMSE": rmse,
+        "MAE": mae,
+        "R2": r2,
+        "r": r,
+        "KGE": kge,
+        "std_obs": std_obs,
+        "std_pred": std_pred,
+        "cRMSE": crmse
+    }
+# --- DATA PREPARATION ---
+def load_and_preprocess_data():
+    print("Loading data...")
+    # 1. Load Precipitation
+    print(f"Loading Precipitation from {EXCEL_FILE_PATH}...")
+    df_precip = pd.read_excel(EXCEL_FILE_PATH)
+    df_precip['datetime'] = pd.to_datetime(df_precip['datetime'])
+    # Ensure no duplicates
+    df_precip = df_precip.drop_duplicates(subset=['datetime'])
+    df_precip = df_precip[['datetime', 'Rain_(mm)']]
+    
+    # 2. Load ERA5
+    print(f"Loading ERA5 from {ERA5_PATH}...")
+    df_era5 = pd.read_excel(ERA5_PATH)
+    df_era5.columns = df_era5.columns.str.strip()
+    
+    # Create datetime: Date + Hour
+    # Assuming 'Hour' is object like "00:00:00"
+    df_era5['datetime'] = pd.to_datetime(df_era5['Date']) + pd.to_timedelta(df_era5['Hour'].astype(str))
+    
+    if 'Rain_(mm)' in df_era5.columns:
+        df_era5 = df_era5.rename(columns={'Rain_(mm)': 'ERA5_Rain'})
+    else:
+        print("Warning: 'Rain_(mm)' not found in ERA5, using 3rd column as rain.")
+        df_era5['ERA5_Rain'] = df_era5.iloc[:, 2]
+        
+    df_era5 = df_era5[['datetime', 'ERA5_Rain']]
+    # Ensure no duplicates
+    df_era5 = df_era5.drop_duplicates(subset=['datetime'])
+    
+    # 3. Merge on Full Date Range
+    print(f"Merging data for full range: {FULL_START} to {FULL_END}...")
+    full_date_range = pd.date_range(start=FULL_START, end=FULL_END, freq='H')
+    df_full = pd.DataFrame({'datetime': full_date_range})
+    
+    df_merged = pd.merge(df_full, df_precip, on='datetime', how='left')
+    df_merged = pd.merge(df_merged, df_era5, on='datetime', how='left')
+    
+    # 4. Handle Missing Values
+    # Fill ERA5 with 0 (assuming missing means no rain or data gap filled with 0)
+    df_merged['ERA5_Rain'] = df_merged['ERA5_Rain'].fillna(0)
+    
+    # Fill Precipitation with 0 for training purposes?
+    # The user script filled everything with 0.
+    df_merged['Rain_(mm)'] = df_merged['Rain_(mm)'].fillna(0)
+    
+    return df_merged
+# --- DATA WINDOWING ---
+class WindowGenerator:
+    def __init__(self, input_width, label_width, shift,
+                 train_df, val_df, test_df,
+                 label_columns=None):
+        self.train_df = train_df
+        self.val_df = val_df
+        self.test_df = test_df
+        self.label_columns = label_columns
+        if label_columns is not None:
+            self.label_columns_indices = {name: i for i, name in enumerate(label_columns)}
+        self.column_indices = {name: i for i, name in enumerate(train_df.columns)}
+        self.input_width = input_width
+        self.label_width = label_width
+        self.shift = shift
+        self.total_window_size = input_width + shift
+        self.input_slice = slice(0, input_width)
+        self.input_indices = np.arange(self.total_window_size)[self.input_slice]
+        self.label_start = self.total_window_size - self.label_width
+        self.label_slice = slice(self.label_start, None)
+        self.label_indices = np.arange(self.total_window_size)[self.label_slice]
+    def split_window(self, features):
+        inputs = features[:, self.input_slice, :]
+        labels = features[:, self.label_slice, :]
+        if self.label_columns is not None:
+            labels = tf.stack(
+                [labels[:, :, self.column_indices[name]] for name in self.label_columns],
+                axis=-1)
+        inputs.set_shape([None, self.input_width, None])
+        labels.set_shape([None, self.label_width, None])
+        return inputs, labels
+    def make_dataset(self, data):
+        data = np.array(data, dtype=np.float32)
+        ds = tf.keras.preprocessing.timeseries_dataset_from_array(
+            data=data,
+            targets=None,
+            sequence_length=self.total_window_size,
+            sequence_stride=1,
+            shuffle=True,
+            batch_size=BATCH_SIZE,)
+        ds = ds.map(self.split_window)
+        return ds
+    @property
+    def train(self):
+        return self.make_dataset(self.train_df)
+    @property
+    def val(self):
+        return self.make_dataset(self.val_df)
+    @property
+    def test(self):
+        return self.make_dataset(self.test_df)
+# --- MAIN EXECUTION ---
+def main():
+    df = load_and_preprocess_data()
+    
+    # Define Training Period Mask
+    mask_train_period = (df['datetime'] >= TRAIN_START) & (df['datetime'] <= TRAIN_END)
+    df_train_period = df.loc[mask_train_period].copy()
+    
+    # Define Full Period
+    mask_full_period = (df['datetime'] >= FULL_START) & (df['datetime'] <= FULL_END)
+    df_full_period = df.loc[mask_full_period].copy()
+    
+    print(f"Training Data Shape (2018-2022): {df_train_period.shape}")
+    print(f"Full Data Shape (2013-2023): {df_full_period.shape}")
+    
+    # --- SCALING ---
+    # Fit scaler ONLY on training data
+    scaler = MinMaxScaler()
+    feature_cols = ['Rain_(mm)', 'ERA5_Rain']
+    scaler.fit(df_train_period[feature_cols])
+    
+    # Transform both
+    df_train_scaled = df_train_period.copy()
+    df_train_scaled[feature_cols] = scaler.transform(df_train_period[feature_cols])
+    
+    df_full_scaled = df_full_period.copy()
+    df_full_scaled[feature_cols] = scaler.transform(df_full_period[feature_cols])
+    
+    # Split Training Data into Train/Val/Test (e.g., 70/20/10)
+    # Note: We must respect time order.
+    n = len(df_train_scaled)
+    train_df = df_train_scaled[0:int(n*0.7)]
+    val_df = df_train_scaled[int(n*0.7):int(n*0.9)]
+    test_df = df_train_scaled[int(n*0.9):]
+    
+    # Scenarios
+    scenarios = {
+        'Scenario_1_Univariate': ['Rain_(mm)'],
+        'Scenario_2_Multivariate': ['Rain_(mm)', 'ERA5_Rain']
+    }
+    
+    results = []
+    best_kge = -np.inf
+    best_model = None
+    best_scenario_name = ""
+    
+    # Helper for inverse transform
+    def inverse_transform_rain(vals):
+        # Create dummy array with 2 columns (since scaler was fit on 2 cols)
+        dummy = np.zeros((len(vals), 2))
+        dummy[:, 0] = vals.flatten()
+        # We only care about column 0 (Rain)
+        return scaler.inverse_transform(dummy)[:, 0]
+    for name, features in scenarios.items():
+        print(f"\n{'='*40}")
+        print(f"Training {name}")
+        print(f"{'='*40}")
+        
+        # Select features
+        train_data = train_df[features]
+        val_data = val_df[features]
+        test_data = test_df[features]
+        
+        # Create Window Generator
+        wg = WindowGenerator(INPUT_WIDTH, LABEL_WIDTH, SHIFT,
+                             train_data, val_data, test_data,
+                             label_columns=['Rain_(mm)'])
+        
+        # Build Model
+        model = Sequential([
+            Bidirectional(LSTM(64, return_sequences=True), input_shape=(INPUT_WIDTH, len(features))),
+            Dropout(0.2),
+            Bidirectional(LSTM(32, return_sequences=False)),
+            Dropout(0.2),
+            Dense(LABEL_WIDTH)
+        ])
+        
+        model.compile(loss='mse', optimizer=Adam(), metrics=['mae'])
+        
+        # Train
+        history = model.fit(wg.train, epochs=EPOCHS, validation_data=wg.val,
+                            callbacks=[EarlyStopping(monitor='val_loss', patience=PATIENCE, restore_best_weights=True)],
+                            verbose=1)
+        
+        # Evaluate on Test Set
+        print(f"Evaluating {name} on Test Set...")
+        test_predictions = model.predict(wg.test)
+        
+        # Get true labels from the dataset
+        test_labels = np.concatenate([y for x, y in wg.test], axis=0)
+        
+        # Inverse Transform
+        pred_inv = inverse_transform_rain(test_predictions)
+        true_inv = inverse_transform_rain(test_labels)
+        
+        # Metrics
+        metrics = calculate_metrics(true_inv, pred_inv)
+        metrics['Scenario'] = name
+        results.append(metrics)
+        
+        print(f"{name} Results: RMSE={metrics['RMSE']:.4f}, KGE={metrics['KGE']:.4f}")
+        
+        # Check if best
+        if metrics['KGE'] > best_kge:
+            best_kge = metrics['KGE']
+            best_model = model
+            best_scenario_name = name
+            
+            # Save this model
+            model_save_path = os.path.join(OUT_DIR, f"best_model_{name}.h5")
+            model.save(model_save_path)
+            print(f"New best model saved to {model_save_path}")
+    # --- COMPARISON & SELECTION ---
+    results_df = pd.DataFrame(results)
+    comparison_csv_path = os.path.join(OUT_DIR, "scenario_comparison_metrics.csv")
+    results_df.to_csv(comparison_csv_path, index=False)
+    
+    print("\n--- Comparison Results ---")
+    print(results_df)
+    print(f"\nBest Model: {best_scenario_name} (KGE={best_kge:.4f})")
+    
+    # --- FULL IMPUTATION ---
+    print(f"\n{'='*40}")
+    print(f"Imputing Full Series ({FULL_START} to {FULL_END}) using {best_scenario_name}")
+    print(f"{'='*40}")
+    
+    # Prepare Full Data for Prediction
+    features_needed = scenarios[best_scenario_name]
+    full_data_values = df_full_scaled[features_needed].values
+    
+    # Create dataset for prediction
+    # We use the same window size.
+    # Note: timeseries_dataset_from_array will produce (N - window_size + 1) batches.
+    ds_full = tf.keras.preprocessing.timeseries_dataset_from_array(
+        data=full_data_values,
+        targets=None,
+        sequence_length=INPUT_WIDTH,
+        sequence_stride=1,
+        shuffle=False,
+        batch_size=128
+    )
+    
+    # Predict
+    print("Generating predictions for full series...")
+    full_preds_scaled = best_model.predict(ds_full)
+    
+    # Inverse Transform
+    full_preds_mm = inverse_transform_rain(full_preds_scaled)
+    
+    # Align Predictions with Dates
+    # The first prediction corresponds to the window [0 : INPUT_WIDTH].
+    # The target for this window (with SHIFT=1) is index INPUT_WIDTH.
+    # So the first prediction is for time t = INPUT_WIDTH.
+    # We need to pad the first INPUT_WIDTH values with NaN.
+    
+    pad_width = len(df_full_period) - len(full_preds_mm)
+    if pad_width < 0:
+        # This shouldn't happen if logic is correct, but safety check
+        print(f"Warning: Prediction length {len(full_preds_mm)} > Data length {len(df_full_period)}")
+        full_preds_padded = full_preds_mm[:len(df_full_period)]
+    else:
+        full_preds_padded = np.pad(full_preds_mm, (pad_width, 0), mode='constant', constant_values=np.nan)
+    
+    df_result = df_full_period.copy()
+    df_result['Predicted_Rain_(mm)'] = full_preds_padded
+    
+    # --- FINAL STATISTICS (on full series where observed exists) ---
+    # Filter for valid predictions AND valid observations (though we filled obs with 0, we might want to check original if available, but here we use the processed one)
+    
+    valid_mask = ~np.isnan(df_result['Predicted_Rain_(mm)'])
+    y_obs_full = df_result.loc[valid_mask, 'Rain_(mm)'].values
+    y_pred_full = df_result.loc[valid_mask, 'Predicted_Rain_(mm)'].values
+    
+    final_metrics = calculate_metrics(y_obs_full, y_pred_full)
+    
+    print("\n--- Final Imputation Statistics (Full Series) ---")
+    for k, v in final_metrics.items():
+        print(f"{k}: {v:.4f}")
+        
+    # Save Metrics to txt
+    metrics_txt_path = os.path.join(OUT_DIR, "final_imputation_metrics.txt")
+    with open(metrics_txt_path, "w") as f:
+        f.write("Metrics for Full Series Imputation (2013-2023)\n")
+        f.write(f"Model Used: {best_scenario_name}\n")
+        for k, v in final_metrics.items():
+            f.write(f"{k}: {v:.4f}\n")
+            
+    # Save Imputed Series
+    imputed_csv_path = os.path.join(OUT_DIR, "imputed_precipitation_2013_2023.csv")
+    df_result.to_csv(imputed_csv_path, index=False)
+    print(f"Saved imputed series to {imputed_csv_path}")
+    print(f"Saved metrics to {metrics_txt_path}")
+if __name__ == "__main__":
+    main()
