@@ -1,0 +1,4327 @@
+"""
+rainfall_ml_comprehensive.py
+================================
+
+This module implements a complete workflow for performing rainfall
+imputation using a suite of machine learning and statistical
+regression models.  It has been designed specifically to support
+the research methodology described by Bustillos Vega et al. (2025),
+which compares univariate versus multivariate modelling scenarios
+and employs a multi‑objective Pareto–Borda ranking to select the
+best performing configuration for each precipitation series.
+
+Key features of this script include:
+
+* **Configuration section** where the user specifies paths to input
+  Excel files, the training window (study period), random seeds
+  and toggles for the types of hyperparameter optimisation to run.
+* **Data loading** for three target series (complete, Isolation
+  Forest filtered and Local Outlier Factor filtered) plus
+  exogenous predictors (INMET, ERA5, ERA5‑Land, CHIRPS,
+  PERSIANN‑CDR).  Summary statistics are computed for the full
+  record (2013–2024) and the study period (2018‑10 to 2022‑09).
+* **Monthly quantile mapping** bias correction for large scale
+  products using INMET as the reference.  Both the raw and
+  corrected versions are retained and later used in scenario
+  definitions.
+* **Feature engineering** to construct lagged precipitation
+  predictors, rolling accumulations, harmonic seasonality terms,
+  wet‑season flags and a hydrological phase index.
+* **Scenario generation** yielding ten distinct design matrices:
+  one univariate scenario (U) and nine multivariate scenarios
+  combining each exogenous source in raw and bias‑corrected form.
+* **Feature selection** based on correlation and optional VIF
+  filtering with safeguards to retain a minimum number of lag and
+  accumulation features.  This is applied only to models that
+  benefit from dimensionality reduction (KNN, SVR and Random
+  Forest), leaving tree based boosting models untouched.
+* **Cross‑validation schemes** including conventional K‑fold,
+  time–series split and hydrological year blocks (Oct–Sep).  An
+  additional “full” splitter treats the entire training window as
+  one fold for completeness.
+* **Hyperparameter tuning** via default settings, grid search,
+  random search and optionally Optuna (if installed).  The user
+  can enable or disable each optimiser independently to manage
+  runtime.
+* **Performance evaluation** using a suite of hydrological and
+  statistical metrics: RMSE, MAE, R², NSE, KGE, Pearson
+  correlation, centred RMSE and percent bias.  Results are
+  aggregated per fold and averaged across folds.
+* **Pareto–Borda ranking** that identifies non‑dominated model
+  configurations (maximising KGE and minimising RMSE) and ranks
+  them via a Borda count across the two metrics.  The best model
+  for each target series is selected for final imputation.
+* **Statistical significance testing** comparing univariate and
+  multivariate scenarios as well as raw versus bias‑corrected
+  scenarios using the Mann–Whitney U test and reporting the
+  Cliff’s delta effect size.
+* **Feature importance** extraction for the top ranked models,
+  leveraging feature importances from tree based ensembles or
+  F‑scores from a SelectKBest stage.
+* **Imputation** of the full precipitation series using the
+  selected best model.  The script retrains the chosen model on
+  the complete training window and then predicts missing values
+  across the entire record, saving the model to a ``.pkl`` file and
+  outputting the imputed series.
+* **Optional visualisation** utilities for plotting autocorrelation
+  functions, quantile mapping histograms, CV timeline charts,
+  performance boxplots and residual diagnostics.  Users can
+  customise or extend these as needed.
+
+This file does not execute anything on import.  Instead the
+``main`` function near the bottom of the module demonstrates how
+one might call the workflow on the three precipitation series.
+
+To run the pipeline on your own machine:
+
+1. Set the ``RAIN_PATH`` and ``EXOG_PATH`` variables below to the
+   locations of your Excel files.
+2. Adjust the ``TRAIN_START`` and ``TRAIN_END`` dates to reflect
+   the period without missing data used for training.
+3. Toggle the optimisation flags (``USE_DEFAULT``, ``USE_GRID``,
+   ``USE_RANDOM``, ``USE_OPTUNA``) and the number of iterations
+   (``N_RANDOM_ITER``, ``N_OPTUNA_TRIALS``) according to your
+   computing resources.
+4. Execute the module from a Python interpreter or notebook.
+
+The code in this module is intentionally verbose with inline
+documentation and clear separation of concerns to aid reproducibility
+and transparency.  It has not been executed in this environment
+because the required input data files are not available here.
+"""
+
+from __future__ import annotations
+
+import os
+import json
+import time
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import (
+    KFold,
+    TimeSeriesSplit,
+    PredefinedSplit,
+    GridSearchCV,
+    RandomizedSearchCV,
+    BaseCrossValidator,
+)
+from sklearn.base import BaseEstimator, clone
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+from xgboost import XGBRegressor
+from catboost import CatBoostRegressor
+from scipy.stats import mannwhitneyu
+
+try:
+    import optuna  # optional dependency
+    _HAS_OPTUNA = True
+except Exception:
+    _HAS_OPTUNA = False
+
+try:
+    import shap  # optional dependency for SHAP importance
+    _HAS_SHAP = True
+except Exception:
+    _HAS_SHAP = False
+
+###############################################################################
+# 0) CONFIGURATION
+###############################################################################
+
+# Input paths for rainfall and exogenous data.  These should be changed
+# according to your local machine.  The files must be Excel
+# workbooks where the first column contains dates and subsequent
+# columns contain the target series or exogenous predictors.
+RAIN_PATH: str = r"C:\Users\alejandra\Desktop\DATA_P\R_rain_outliers_cleaned.xlsx"
+EXOG_PATH: str = r"C:\Users\alejandra\Desktop\DATA_P\dados_daily_v_exogenas.xlsx"
+
+# Training window for model fitting.  Only data within this period
+# (inclusive) are used to train the models.  This window should
+# correspond to the continuous segment of the rainfall series with no
+# missing values.  In this version of the script, the training
+# window runs from 1 January 2018 to 30 September 2022, as requested
+# by the user.
+TRAIN_START: str = "2018-01-01"
+TRAIN_END: str = "2022-09-30"
+
+# Cross‑validation and optimisation toggles.  These flags control
+# whether default models, grid search, random search and Optuna
+# hyperparameter tuning are performed.  Adjust to suit your
+# available computing resources.  Optuna requires the optional
+# dependency ``optuna`` to be installed.
+USE_DEFAULT: bool = True
+USE_GRID: bool = True
+USE_RANDOM: bool = False
+USE_OPTUNA: bool = True  # set to True if Optuna is installed and desired
+
+# Number of iterations/trials for random search and Optuna
+N_RANDOM_ITER: int = 30
+N_OPTUNA_TRIALS: int = 30
+
+# Reproducibility seed for random number generators
+SEED: int = 42
+
+# List of exogenous product names as they appear in the exogenous
+# Excel file.  These names must match column names in the loaded
+# DataFrame.  INMET is treated separately as the reference for
+# quantile mapping but also can be included as an exogenous
+# predictor.
+EXOG_PRODUCTS: List[str] = ["INMET", "ERA5", "ERA5land", "CHIRPS", "PERSIANN_CDR"]
+
+# Output root directory for saving results, tables and figures.  It is
+# defined here so that it is available before any reference in
+# the workflow.  All generated files will be placed under this
+# directory.
+OUTPUT_ROOT: str = "outputs_rainfall_imputation"
+
+###############################################################################
+# 1) METRIC FUNCTIONS
+###############################################################################
+
+def nse(y: np.ndarray, yhat: np.ndarray) -> float:
+    """Compute the Nash–Sutcliffe efficiency coefficient.
+
+    Returns NaN if the denominator is zero (i.e., constant observed
+    series).
+    """
+    den = np.sum((y - np.mean(y)) ** 2)
+    return np.nan if den == 0 else 1.0 - np.sum((y - yhat) ** 2) / den
+
+
+def kge(y: np.ndarray, yhat: np.ndarray) -> float:
+    """Compute the Kling–Gupta Efficiency (KGE) metric.
+
+    KGE combines correlation (r), variability ratio (alpha) and bias
+    ratio (beta) in a single statistic.  Values closer to 1 indicate
+    better agreement between observed and predicted values.  If
+    standard deviation or mean of either series is zero, the
+    corresponding component becomes NaN and the overall KGE is
+    undefined.
+    """
+    if y.size == 0:
+        return np.nan
+    if np.std(y) == 0 or np.std(yhat) == 0 or np.sum(y) == 0:
+        return np.nan
+    r = np.corrcoef(y, yhat)[0, 1]
+    alpha = np.std(yhat) / np.std(y)
+    beta = np.sum(yhat) / np.sum(y)
+    return 1.0 - np.sqrt((r - 1.0) ** 2 + (alpha - 1.0) ** 2 + (beta - 1.0) ** 2)
+
+
+def centred_rmse(y: np.ndarray, yhat: np.ndarray) -> float:
+    """Compute the centred (or unbiased) root mean square error.
+    This metric removes the mean from both observed and predicted
+    series before computing the RMSE.  It is useful for comparing
+    variability independent of bias.
+    """
+    return np.sqrt(np.mean(((yhat - np.mean(yhat)) - (y - np.mean(y))) ** 2))
+
+
+def pbias(y: np.ndarray, yhat: np.ndarray) -> float:
+    """Compute the percent bias (PBIAS) metric expressed in percent.
+    Returns NaN if the denominator is zero.
+    """
+    den = np.sum(y)
+    return np.nan if den == 0 else 100.0 * np.sum(yhat - y) / den
+
+
+def compute_metrics(y: np.ndarray, yhat: np.ndarray) -> Dict[str, float]:
+    """Compute a dictionary of evaluation metrics given observed and
+    predicted values.
+
+    The metrics returned include RMSE, MAE, R2, NSE, KGE, Pearson
+    correlation (r), centred RMSE (cRMSE) and percent bias (PBIAS).
+
+    Parameters
+    ----------
+    y : ndarray
+        Array of observed values.
+    yhat : ndarray
+        Array of predicted values of the same shape as ``y``.
+
+    Returns
+    -------
+    dict
+        Keys are metric names, values are the computed metrics.
+    """
+    return {
+        "RMSE": float(np.sqrt(mean_squared_error(y, yhat))),
+        "MAE": float(mean_absolute_error(y, yhat)),
+        "R2": float(r2_score(y, yhat)),
+        "NSE": float(nse(y, yhat)),
+        "KGE": float(kge(y, yhat)),
+        "r": float(np.corrcoef(y, yhat)[0, 1]) if y.size > 1 else np.nan,
+        "cRMSE": float(centred_rmse(y, yhat)),
+        "PBIAS": float(pbias(y, yhat)),
+    }
+
+###############################################################################
+# 2) DATA LOADING AND SUMMARY STATISTICS
+###############################################################################
+
+def read_daily_excel(path: str, date_col: int = 0) -> pd.DataFrame:
+    """Read a daily time series from an Excel file.
+
+    The first column is assumed to contain dates, which are parsed
+    into a pandas ``DatetimeIndex``. The resulting DataFrame is
+    sorted by date and reindexed to daily frequency to ensure
+    continuity. Any missing dates are filled with NaNs.
+
+    Parameters
+    ----------
+    path : str
+        Path to the Excel file.
+    date_col : int, default 0
+        Index of the column containing dates.
+
+    Returns
+    -------
+    DataFrame
+        DataFrame with a daily ``DatetimeIndex`` and one column per
+        series or predictor contained in the Excel file.
+    """
+    df = pd.read_excel(path)
+    # Ensure the date column is parsed to datetime
+    df.iloc[:, date_col] = pd.to_datetime(df.iloc[:, date_col])
+    df = df.set_index(df.columns[date_col]).sort_index()
+    # Reindex to daily frequency; this inserts NaNs for missing dates
+    df = df.asfreq("D")
+    return df
+
+
+def dataset_statistics(
+    rain_df: pd.DataFrame,
+    target_cols: List[str],
+    full_start: Optional[str] = None,
+    full_end: Optional[str] = None,
+    train_start: str = TRAIN_START,
+    train_end: str = TRAIN_END,
+) -> pd.DataFrame:
+    """Compute descriptive statistics for the full and training periods.
+
+    This function summarises the number of observations, the percent
+    missing values and basic descriptive statistics (min, max, mean,
+    median, standard deviation, quartiles) for each target series
+    across two periods: the complete record and the training window.
+
+    Parameters
+    ----------
+    rain_df : DataFrame
+        DataFrame containing the target series.
+    target_cols : list of str
+        Names of the target columns to analyse.
+    full_start, full_end : str or None
+        Date strings defining the full period of interest. If None,
+        the min/max of the index are used.
+    train_start, train_end : str
+        Date strings defining the study period (training window).
+
+    Returns
+    -------
+    DataFrame
+        A long format table with one row per series and period.
+    """
+    if full_start is None:
+        full_start = str(rain_df.index.min().date())
+    if full_end is None:
+        full_end = str(rain_df.index.max().date())
+
+    periods = {
+        "full": (pd.to_datetime(full_start), pd.to_datetime(full_end)),
+        "train": (pd.to_datetime(train_start), pd.to_datetime(train_end)),
+    }
+    stats_rows = []
+    for series in target_cols:
+        for per_name, (s, e) in periods.items():
+            sub = rain_df[series].loc[s:e]
+            total = len(sub)
+            n_missing = sub.isna().sum()
+            n_obs = total - n_missing
+            missing_pct = 100.0 * n_missing / total if total > 0 else np.nan
+            # Descriptive stats ignoring NaNs
+            desc = sub.describe(percentiles=[0.25, 0.5, 0.75]).to_dict()
+            stats_rows.append(
+                {
+                    "series": series,
+                    "period": per_name,
+                    "start": s.date(),
+                    "end": e.date(),
+                    "total_days": total,
+                    "observations": n_obs,
+                    "missing_pct": missing_pct,
+                    "min": desc.get("min", np.nan),
+                    "25%": desc.get("25%", np.nan),
+                    "median": desc.get("50%", np.nan),
+                    "75%": desc.get("75%", np.nan),
+                    "max": desc.get("max", np.nan),
+                    "mean": desc.get("mean", np.nan),
+                    "std": desc.get("std", np.nan),
+                }
+            )
+    return pd.DataFrame(stats_rows)
+###############################################################################
+# 3) BIAS CORRECTION VIA MONTHLY QUANTILE MAPPING
+###############################################################################
+
+class MonthlyQuantileMapper:
+    """
+    Perform monthly empirical quantile mapping (QM) to correct systematic bias.
+
+    The mapping is fit *only* on the training window (TRAIN_START–TRAIN_END),
+    but is applied to the *entire* index (full rainfall period).
+
+    Characteristics:
+    - Preserves zeros: values ≤ 0 map to 0.
+    - Uses empirical CDF per month.
+    - Handles missing or empty-month cases gracefully.
+    """
+
+    def __init__(self):
+        self.params: Dict[int, Dict[str, np.ndarray]] = {}
+
+    @staticmethod
+    def _ecdf(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute empirical CDF for an array of values."""
+        x = np.asarray(x)
+        x = x[np.isfinite(x) & (x > 0.0)]  # ignore NaN and non-positive
+        if x.size == 0:
+            return np.array([]), np.array([])
+        xs = np.sort(x)
+        ps = np.linspace(1.0 / len(xs), 1.0, len(xs))
+        return xs, ps
+
+    def fit(
+        self,
+        predictor: pd.Series,
+        reference: pd.Series,
+        train_index: pd.DatetimeIndex,
+    ) -> "MonthlyQuantileMapper":
+        """
+        Fit monthly quantile mapping parameters using ONLY the training window.
+        """
+        p_train = predictor.reindex(train_index)
+        r_train = reference.reindex(train_index)
+        self.params = {}
+
+        for month in range(1, 13):
+            sel = train_index.month == month
+            if sel.sum() == 0:
+                continue
+
+            xs, ps = self._ecdf(p_train[sel].values)
+            ys, qs = self._ecdf(r_train[sel].values)
+            self.params[month] = {"xs": xs, "ps": ps, "ys": ys, "qs": qs}
+
+        return self
+
+    def transform(self, predictor: pd.Series, full_index: pd.DatetimeIndex) -> pd.Series:
+        """
+        Apply the fitted QM transformation across the whole dataset.
+        """
+        p = predictor.reindex(full_index)
+        out = pd.Series(index=full_index, dtype=float)
+
+        for month in range(1, 13):
+            sel = full_index.month == month
+            if sel.sum() == 0:
+                continue
+
+            pars = self.params.get(month)
+            if pars is None or pars["xs"].size == 0 or pars["ys"].size == 0:
+                out[sel] = np.maximum(p[sel].values, 0.0)
+                continue
+
+            x = p[sel].values.astype(float)
+            mapped = np.zeros_like(x)
+
+            pos = x > 0.0
+            vals = x[pos]
+
+            if vals.size > 0:
+                # Step 1: empirical quantile of predictor
+                Fp = np.interp(vals,
+                               pars["xs"], pars["ps"],
+                               left=0.0, right=1.0)
+                # Step 2: map quantile to reference distribution
+                Qr = np.interp(Fp,
+                               pars["qs"], pars["ys"],
+                               left=pars["ys"][0], right=pars["ys"][-1])
+                mapped[pos] = Qr
+
+            out[sel] = np.maximum(mapped, 0.0)
+
+        return out
+
+
+def apply_quantile_mapping(
+    exog_df: pd.DataFrame,
+    reference: pd.Series,
+    train_index: pd.DatetimeIndex,
+    exog_products: Iterable[str],
+) -> Dict[str, pd.Series]:
+    """
+    Create bias-corrected versions (QM) of each exogenous product.
+
+    - Fitting uses ONLY the training window.
+    - The correction is applied to the *full* index.
+    - Returns dict: {"ERA5_QM": series, "CHIRPS_QM": series, ...}
+    """
+    qm_dict: Dict[str, pd.Series] = {}
+    full_index = exog_df.index
+
+    for prod in exog_products:
+        if prod == "INMET":
+            # INMET is reference, never corrected
+            continue
+
+        mapper = MonthlyQuantileMapper()
+        mapper.fit(
+            predictor=exog_df[prod],
+            reference=reference,
+            train_index=train_index,
+        )
+        corrected = mapper.transform(exog_df[prod], full_index)
+        qm_dict[f"{prod}_QM"] = corrected
+
+    return qm_dict
+
+###############################################################################
+# 4) FEATURE ENGINEERING AND SCENARIO CONSTRUCTION
+###############################################################################
+
+# Feature engineering settings
+LAGS_TARGET: int = 14               # number of lagged precipitation values
+ACC_WINDOWS: List[int] = [3, 7, 14] # rolling accumulation windows
+EXO_LAGS: List[int] = [0, 1, 2]     # lags for exogenous predictors
+WET_MONTHS: List[int] = [10, 11, 12, 1, 2, 3]  # wet season months (Oct–Mar)
+
+
+def build_daily_features(
+    y: pd.Series,
+    lags: int = LAGS_TARGET,
+    acc_windows: Iterable[int] = ACC_WINDOWS
+) -> pd.DataFrame:
+    """
+    Build endogenous features for a precipitation series.
+
+    Includes:
+    - Lagged precipitation (1–lags)
+    - Rolling accumulation (shifted to avoid leakage)
+    - DOY harmonic terms
+    - Wet season indicator
+    - Hydrological phase index (0–1 scaled within hydrological year)
+    """
+
+    df = pd.DataFrame(index=y.index)
+
+    # Lagged precipitation
+    for k in range(1, lags + 1):
+        df[f"lag_{k}"] = y.shift(k)
+
+    # Rolling accumulations (shifted by 1 day for no leakage)
+    for w in acc_windows:
+        df[f"R_{w}d"] = y.rolling(w).sum().shift(1)
+
+    # Seasonal harmonic terms
+    doy = df.index.dayofyear
+    df["DOY_sin"] = np.sin(2.0 * np.pi * doy / 365.0)
+    df["DOY_cos"] = np.cos(2.0 * np.pi * doy / 365.0)
+
+    # Wet season indicator
+    df["WET_flag"] = df.index.month.isin(WET_MONTHS).astype(int)
+
+    # Hydrological phase index (scaled 0–1)
+    hydroy = np.where(df.index.month >= 10, df.index.year, df.index.year - 1)
+    hyd_start = pd.to_datetime([f"{hy}-10-01" for hy in hydroy])
+    delta_days = (df.index - hyd_start).days
+    df["HY_phase"] = delta_days / 365.0
+
+    # Add target at the end
+    df["target"] = y
+
+    return df
+
+
+def build_exogenous_features(
+    exog_df: pd.DataFrame,
+    exog_products: Iterable[str],
+    qm_dict: Dict[str, pd.Series],
+    full_index: pd.DatetimeIndex
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Produce two sets of exogenous features:
+    - RAW features (original)
+    - QM features (bias-corrected)
+
+    Each includes:
+    - Lags in EXO_LAGS
+    """
+
+    # RAW MATRIX
+    raw_feats = pd.DataFrame(index=full_index)
+
+    for prod in exog_products:
+        if prod not in exog_df.columns:
+            continue
+
+        for lag in EXO_LAGS:
+            colname = f"{prod}_lag{lag}"
+            raw_feats[colname] = exog_df[prod].shift(lag)
+
+    # QM MATRIX
+    qm_feats = pd.DataFrame(index=full_index)
+
+    for prod in exog_products:
+        key = f"{prod}_QM"
+        if key not in qm_dict:
+            continue
+
+        for lag in EXO_LAGS:
+            colname = f"{prod}_QM_lag{lag}"
+            qm_feats[colname] = qm_dict[key].shift(lag)
+
+    return raw_feats, qm_feats
+
+
+def build_scenarios(
+    y: pd.Series,
+    endogenous_df: pd.DataFrame,
+    raw_exog_df: pd.DataFrame,
+    qm_exog_df: pd.DataFrame,
+    exog_products: Iterable[str]
+) -> Dict[str, pd.DataFrame]:
+    """
+    Build all scenarios:
+    - U : Univariate (only endogenous features)
+    - M-RAW  : Multivariate raw exogenous + endogenous
+    - M-QM   : Multivariate bias-corrected exogenous + endogenous
+
+    Each scenario returns a DataFrame containing:
+    - all relevant features
+    - the column 'target' at the end
+    """
+
+    scenarios = {}
+
+    # -------------------------------
+    # Univariate scenario (U)
+    # -------------------------------
+    scen_U = endogenous_df.copy()
+    scenarios["U"] = scen_U
+
+    # -------------------------------
+    # Multivariate RAW scenario (per product)
+    # -------------------------------
+    for prod in exog_products:
+        #if prod == "INMET":   # INMET no se usa como predictor principal (referencia QM)
+         #   continue
+
+        # seleccionar solo columnas RAW del producto
+        raw_cols = [c for c in raw_exog_df.columns if c.startswith(f"{prod}_lag")]
+
+        if len(raw_cols) == 0:
+            continue
+
+        df_M_raw = pd.concat(
+            [endogenous_df, raw_exog_df[raw_cols]],
+            axis=1
+        )
+        scenarios[f"M-{prod}"] = df_M_raw
+
+    # -------------------------------
+    # Multivariate QM scenario (per product)
+    # -------------------------------
+    for prod in exog_products:
+        key = f"{prod}_QM"
+        qm_cols = [c for c in qm_exog_df.columns if c.startswith(f"{prod}_QM_lag")]
+
+        if len(qm_cols) == 0:
+            continue
+
+        df_M_qm = pd.concat(
+            [endogenous_df, qm_exog_df[qm_cols]],
+            axis=1
+        )
+        scenarios[f"M-{prod}_QM"] = df_M_qm
+
+    return scenarios
+
+###############################################################################
+# 5) FEATURE SELECTION
+###############################################################################
+
+def calculate_vif(df_num: pd.DataFrame) -> pd.DataFrame:
+    """Compute variance inflation factors (VIF) for numerical columns.
+
+    VIF is a diagnostic for multicollinearity; values above 5–10
+    indicate severe collinearity.  The DataFrame must contain only
+    numeric columns.
+
+    Parameters
+    ----------
+    df_num : DataFrame
+        DataFrame of numeric features (no target column).
+
+    Returns
+    -------
+    DataFrame
+        Table with columns ``'feature'`` and ``'VIF'``.
+    """
+    # Drop non finite values and require at least two columns
+    df = df_num.replace([np.inf, -np.inf], np.nan).dropna(axis=0)
+    if df.shape[1] < 2:
+        return pd.DataFrame(columns=["feature", "VIF"])
+    # Statsmodels is used here to compute VIF
+    import statsmodels.api as sm  # imported here to avoid global dependency
+    from statsmodels.stats.outliers_influence import variance_inflation_factor
+    X = sm.add_constant(df)
+    vif_vals = [variance_inflation_factor(X.values, i + 1) for i in range(len(df.columns))]
+    return pd.DataFrame({"feature": df.columns, "VIF": vif_vals})
+
+
+def prefilter_features(
+    X: pd.DataFrame,
+    scenario_name: str,
+    corr_threshold: float = 0.90,
+    vif_threshold: Optional[float] = None,
+    min_keep_lags: int = 8,
+    min_keep_acc: int = 3,
+    exclude_prefixes: Iterable[str] = (
+        "ERA5",
+        "ERA5land",
+        "CHIRPS",
+        "PERSIANN",
+        "INMET",
+        "_QM",
+    ),
+) -> pd.DataFrame:
+    """Reduce dimensionality by dropping highly correlated and collinear features.
+
+    This function performs two stages of filtering on the columns of a
+    feature matrix:
+
+    1. **Correlation threshold** – pairwise absolute correlations
+       between eligible features (those not starting with prefixes in
+       ``exclude_prefixes``) are computed.  If two features exceed
+       ``corr_threshold``, one is dropped.
+    2. **Variance Inflation Factor (VIF) filter** – if
+       ``vif_threshold`` is provided, features with VIF greater than
+       this threshold are removed.
+
+    After filtering, safeguards ensure that at least
+    ``min_keep_lags`` lagged precipitation features and
+    ``min_keep_acc`` accumulation features remain.  If fewer are
+    retained, missing ones are restored.
+
+    The target column is preserved throughout and returned at the end.
+
+    Parameters
+    ----------
+    X : DataFrame
+        Feature matrix including the ``'target'`` column.
+    scenario_name : str
+        Name of the scenario for logging and reporting.
+    corr_threshold : float
+        Threshold above which one of a pair of correlated features
+        will be dropped (default 0.90).
+    vif_threshold : float or None
+        Threshold above which features with high VIF are dropped.
+    min_keep_lags : int
+        Minimum number of lagged precipitation features to retain.
+    min_keep_acc : int
+        Minimum number of accumulation features to retain.
+    exclude_prefixes : iterable of str
+        Column name prefixes that are excluded from correlation and
+        VIF analysis (e.g. exogenous predictors).  These columns are
+        always kept.
+
+    Returns
+    -------
+    DataFrame
+        Reduced feature matrix with ``'target'`` column.
+    """
+    all_feats = list(X.columns)
+    if "target" not in all_feats:
+        raise ValueError("The input matrix must contain a 'target' column.")
+    eligible = [f for f in all_feats if not any(f.startswith(pfx) for pfx in exclude_prefixes) and f != "target"]
+    fixed = [f for f in all_feats if f not in eligible and f != "target"]
+    # Work only on the eligible features for correlation and VIF
+    X_elig = X[eligible].replace([np.inf, -np.inf], np.nan).fillna(X[eligible].mean())
+    # Correlation filtering
+    drop_corr: List[str] = []
+    if X_elig.shape[1] > 1:
+        corr = X_elig.corr().abs()
+        upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+        drop_corr = [c for c in upper.columns if any(upper[c] > corr_threshold)]
+        X_red = X_elig.drop(columns=drop_corr, errors="ignore")
+    else:
+        X_red = X_elig.copy()
+    # VIF filtering
+    drop_vif: List[str] = []
+    if vif_threshold is not None and X_red.shape[1] > 1:
+        vif_df = calculate_vif(X_red)
+        drop_vif = vif_df.loc[vif_df["VIF"] > float(vif_threshold), "feature"].tolist()
+        X_red = X_red.drop(columns=drop_vif, errors="ignore")
+    # Reattach fixed columns (exogenous predictors and target will be restored later)
+    X_reduced = X_red.copy()
+    for f in fixed:
+        if f in X.columns and f not in X_reduced.columns:
+            X_reduced[f] = X[f]
+    # Safeguard: ensure minimum number of lag and accumulation features
+    have_lags = [c for c in X_reduced.columns if c.startswith("lag_")]
+    have_acc = [c for c in X_reduced.columns if c.startswith("R_")]
+    # Restore lag features if too few remain
+    if len(have_lags) < min_keep_lags:
+        missing = [c for c in sorted([c for c in X.columns if c.startswith("lag_")], key=lambda s: int(s.split("_")[1])) if c not in X_reduced.columns]
+        restore = missing[: max(0, min_keep_lags - len(have_lags))]
+        for col in restore:
+            X_reduced[col] = X[col]
+    # Restore accumulation features if too few remain
+    if len(have_acc) < min_keep_acc:
+        missing = [c for c in [c for c in X.columns if c.startswith("R_") and c.endswith("d")] if c not in X_reduced.columns]
+        restore = missing[: max(0, min_keep_acc - len(have_acc))]
+        for col in restore:
+            X_reduced[col] = X[col]
+    # Finally add the target column back
+    X_reduced["target"] = X["target"]
+    return X_reduced
+
+
+def build_feature_selected_scenarios(
+    scenarios: Dict[str, pd.DataFrame],
+    train_start: str = TRAIN_START,
+    train_end: str = TRAIN_END,
+    **fs_kwargs,
+) -> Dict[str, pd.DataFrame]:
+    """Apply prefiltering feature selection to each scenario.
+
+    The selection is performed only on data within the training window
+    (to avoid data leakage).  The resulting column set is then
+    applied to the entire time series.  Feature selection is not
+    applied to tree boosting models, but it is beneficial for KNN,
+    SVR and Random Forest.
+
+    Parameters
+    ----------
+    scenarios : dict
+        Mapping from scenario names to design matrices including
+        ``'target'``.
+    train_start, train_end : str
+        Date strings defining the training window for feature
+        selection.
+    fs_kwargs : dict
+        Additional arguments passed to ``prefilter_features``.
+
+    Returns
+    -------
+    dict
+        Mapping from scenario names to reduced design matrices.
+    """
+    selected: Dict[str, pd.DataFrame] = {}
+    for scen_name, Xmat in scenarios.items():
+        # Work only on rows without NaNs for feature selection
+        Xclean = Xmat.dropna()
+        if Xclean.empty:
+            # If the scenario contains only NaNs, keep as is
+            selected[scen_name] = Xmat.copy()
+            continue
+        # Subset to the training window
+        train_mask = (Xclean.index >= train_start) & (Xclean.index <= train_end)
+        Xtrain = Xclean.loc[train_mask]
+        # Apply prefiltering on train subset
+        Xtrain_red = prefilter_features(Xtrain, scen_name, **fs_kwargs)
+        # Determine which columns are kept
+        keep_cols = list(Xtrain_red.columns)
+        # Apply the same column selection to the entire design matrix (aligning missing columns)
+        Xsel = Xmat[keep_cols].copy()
+        selected[scen_name] = Xsel
+    return selected
+
+
+###############################################################################
+# 6) CROSS-VALIDATION SPLITTERS
+###############################################################################
+
+class HydrologicalYearSplit(BaseCrossValidator):
+    """
+    Custom splitter using hydrological years (Oct–Sep) as folds.
+    Example for 2018–2022 window:
+        HY 2018: 2018-10-01 → 2019-09-30
+        HY 2019: 2019-10-01 → 2020-09-30
+        HY 2020: 2020-10-01 → 2021-09-30
+        HY 2021: 2021-10-01 → 2022-09-30
+    """
+    def __init__(self, index: pd.DatetimeIndex):
+        self.index = index
+        self.hydro_years = sorted(
+            set(np.where(index.month >= 10, index.year, index.year - 1))
+        )
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return len(self.hydro_years)
+
+    def split(self, X, y=None, groups=None):
+        for hy in self.hydro_years:
+            start = pd.Timestamp(f"{hy}-10-01")
+            end   = pd.Timestamp(f"{hy+1}-09-30")
+            mask = (self.index >= start) & (self.index <= end)
+            test_idx = np.where(mask)[0]
+            train_idx = np.where(~mask)[0]
+            yield train_idx, test_idx
+
+
+def get_cv_splitters(
+    index: pd.DatetimeIndex,
+    hyd_enabled: bool = True,
+    n_splits: int = 5
+) -> Dict[str, BaseCrossValidator]:
+    """
+    Build all cross-validation strategies used in the study.
+
+    Returns
+    -------
+    dict:
+        {
+            "KFold": <KFold>,
+            "TSS": <TimeSeriesSplit>,
+            "HY": <HydrologicalYearSplit>,
+            "FULL": <BaseCrossValidator>
+        }
+    """
+
+    splitters = {}
+
+    # -------------------------------
+    # 1) Standard KFold (NOT shuffled)
+    # -------------------------------
+    splitters["KFold"] = KFold(
+        n_splits=n_splits,
+        shuffle=False
+    )
+
+    # -------------------------------
+    # 2) TimeSeriesSplit (forward chaining)
+    # -------------------------------
+    splitters["TSS"] = TimeSeriesSplit(
+        n_splits=n_splits
+    )
+
+    # -------------------------------
+    # 3) Hydrological Year based split
+    # -------------------------------
+    if hyd_enabled:
+        splitters["HY"] = HydrologicalYearSplit(index)
+
+    # -------------------------------
+    # 4) FULL SPLIT
+    # Used for completeness: entire period is one fold.
+    # -------------------------------
+    
+
+    print("\n🧩 Cross-validation strategies loaded:")
+    for k in splitters:
+        print(f"   • {k}")
+
+    return splitters
+
+###############################################################################
+# 7) MODEL TRAINING, SEARCH AND METRIC EXTRACTION (FIXED FINAL VERSION)
+###############################################################################
+
+def serialize_params(est: BaseEstimator) -> str:
+    """Safely serialize estimator parameters to JSON string."""
+    try:
+        params = est.get_params(deep=True)
+        return json.dumps(params, default=str)
+    except Exception:
+        return ""
+
+
+# ============================================================
+# MODEL EVALUATION (NO CAMBIA)
+# ============================================================
+def evaluate_model(model: Pipeline, X: pd.DataFrame, y: pd.Series,
+                   splitter: BaseCrossValidator) -> Dict[str, float]:
+    metrics_list = []
+
+    for train_idx, test_idx in splitter.split(X, y):
+        Xtr, Xte = X.iloc[train_idx], X.iloc[test_idx]
+        ytr, yte = y.iloc[train_idx], y.iloc[test_idx]
+
+        # Clean training data
+        mask_tr = (~Xtr.isna().any(axis=1)) & (~ytr.isna())
+        mask_te = (~Xte.isna().any(axis=1)) & (~yte.isna())
+
+        if mask_tr.sum() == 0 or mask_te.sum() == 0:
+            continue
+
+        Xtr2 = Xtr.loc[mask_tr]
+        ytr2 = ytr.loc[mask_tr]
+        Xte2 = Xte.loc[mask_te]
+        yte2 = yte.loc[mask_te]
+
+        # Fit / Predict
+        model.fit(Xtr2, ytr2)
+        pred = model.predict(Xte2)
+
+        # Metrics
+        m = compute_metrics(yte2.values, pred)
+        metrics_list.append(m)
+
+    if len(metrics_list) == 0:
+        return {k: np.nan for k in compute_metrics(np.array([1]), np.array([1])).keys()}
+
+    keys = metrics_list[0].keys()
+    return {k: np.nanmean([m[k] for m in metrics_list]) for k in keys}
+
+
+# ============================================================
+# PARAMETER GRIDS (NUEVO)
+# ============================================================
+param_grids = {
+    "KNN": {
+        "model__n_neighbors": [3, 5, 7, 9]
+    },
+    "SVR": {
+        "model__C": [1, 10, 20],
+        "model__epsilon": [0.05, 0.1, 0.2]
+    },
+    "RF": {
+        "model__n_estimators": [200, 400],
+        "model__max_depth": [5, 10, None]
+    },
+    "XGB": {
+        "model__max_depth": [3, 5, 7],
+        "model__learning_rate": [0.03, 0.05, 0.1]
+    },
+    "CAT": {
+        "model__depth": [4, 6, 8],
+        "model__learning_rate": [0.03, 0.05, 0.1]
+    }
+}
+
+# Para Random Search usamos los mismos parámetros
+param_dists = {k: v for k, v in param_grids.items()}
+
+
+# ============================================================
+# MAIN TRAINING FUNCTION (VERSIÓN FINAL)
+# ============================================================
+def train_and_evaluate_scenario(
+    scen_name: str,
+    scen_df: pd.DataFrame,
+    models: Dict[str, BaseEstimator],
+    splitters: Dict[str, BaseCrossValidator],
+    use_fs: bool = True,
+    use_grid: bool = False,
+    use_random: bool = False,
+    use_optuna: bool = False,
+    n_random_iter: int = 25,
+    n_opt_trials: int = 25,
+) -> pd.DataFrame:
+
+    print(f"\n\n🔵 Escenario: {scen_name}")
+    results_rows = []
+
+    # -----------------------------------------------------------
+    # CLEAN Xfull / yfull
+    # -----------------------------------------------------------
+    Xfull = scen_df.drop(columns=["target"])
+    yfull = scen_df["target"]
+
+    valid_mask = ~Xfull.isna().all(axis=1)
+    Xfull = Xfull.loc[valid_mask]
+    yfull = yfull.loc[valid_mask]
+
+    # Data ohne NaNs para SearchCV
+    mask_clean = (~Xfull.isna().any(axis=1)) & (~yfull.isna())
+    Xgrid = Xfull.loc[mask_clean]
+    ygrid = yfull.loc[mask_clean]
+
+    # -----------------------------------------------------------
+    for split_name, splitter in splitters.items():
+        print(f"\n   🟣 CV: {split_name}")
+
+        for model_name, model_obj in models.items():
+            print(f"      🔸 Modelo: {model_name}")
+
+            needs_fs = model_name in ["KNN", "SVR", "RF"] and use_fs
+
+            # Build pipeline
+            pipe_steps = []
+            pipe_steps.append(("imputer", SimpleImputer(strategy="mean")))
+            if needs_fs:
+                pipe_steps.append(("scaler", StandardScaler()))
+                pipe_steps.append(("fs", SelectKBest(score_func=f_regression, k="all")))
+            pipe_steps.append(("model", model_obj))
+
+            base_estimator = Pipeline(pipe_steps)
+
+            # ====================================================
+            # DEFAULT
+            # ====================================================
+            print("         → Default")
+            metrics = evaluate_model(base_estimator, Xfull, yfull, splitter)
+
+            # std_obs
+            std_obs = float(np.std(yfull.dropna()))
+
+            # std_pred
+            try:
+                preds_default = base_estimator.fit(
+                    Xgrid, ygrid
+                ).predict(Xfull.fillna(Xfull.mean()))
+                std_pred = float(np.std(preds_default))
+            except:
+                std_pred = np.nan
+
+            results_rows.append({
+                "scenario": scen_name,
+                "model": model_name,
+                "optimiser": "Default",
+                "split": split_name,
+                "params": serialize_params(base_estimator),
+                **metrics,
+                "std_obs": std_obs,
+                "std_pred": std_pred,
+            })
+
+            # ====================================================
+            # GRID SEARCH
+            # ====================================================
+            if use_grid:
+                print("         → Grid Search")
+                param_grid = param_grids.get(model_name, {})
+
+                if param_grid:
+                    try:
+                        gs = GridSearchCV(
+                            estimator=base_estimator,
+                            param_grid=param_grid,
+                            scoring="neg_root_mean_squared_error",
+                            cv=2
+                        )
+                        gs.fit(Xgrid, ygrid)
+                        best_pipe = gs.best_estimator_
+
+                        metrics = evaluate_model(best_pipe, Xfull, yfull, splitter)
+
+                        preds_grid = best_pipe.predict(Xfull.fillna(Xfull.mean()))
+                        std_pred = float(np.std(preds_grid))
+
+                        results_rows.append({
+                            "scenario": scen_name,
+                            "model": model_name,
+                            "optimiser": "Grid",
+                            "split": split_name,
+                            "params": serialize_params(best_pipe),
+                            **metrics,
+                            "std_obs": std_obs,
+                            "std_pred": std_pred,
+                        })
+                    except Exception as e:
+                        print(f"Grid error: {e}")
+
+            # ====================================================
+            # RANDOM SEARCH
+            # ====================================================
+            if use_random:
+                print("         → Random Search")
+                param_dist = param_dists.get(model_name, {})
+
+                if param_dist:
+                    try:
+                        rs = RandomizedSearchCV(
+                            estimator=base_estimator,
+                            param_distributions=param_dist,
+                            n_iter=n_random_iter,
+                            scoring="neg_root_mean_squared_error",
+                            cv=2,
+                            random_state=42,
+                        )
+                        rs.fit(Xgrid, ygrid)
+                        best_pipe = rs.best_estimator_
+
+                        metrics = evaluate_model(best_pipe, Xfull, yfull, splitter)
+
+                        preds_rs = best_pipe.predict(Xfull.fillna(Xfull.mean()))
+                        std_pred = float(np.std(preds_rs))
+
+                        results_rows.append({
+                            "scenario": scen_name,
+                            "model": model_name,
+                            "optimiser": "Random",
+                            "split": split_name,
+                            "params": serialize_params(best_pipe),
+                            **metrics,
+                            "std_obs": std_obs,
+                            "std_pred": std_pred,
+                        })
+                    except Exception as e:
+                        print(f"Random search error: {e}")
+
+            # ====================================================
+            # OPTUNA
+            # ====================================================
+            if use_optuna and _HAS_OPTUNA:
+                print("         → Optuna Search")
+                param_dist = param_dists.get(model_name, {})
+
+                if param_dist:
+                    try:
+
+                        def objective(trial):
+                            params = {
+                                pname: trial.suggest_categorical(pname, pvals)
+                                for pname, pvals in param_dist.items()
+                            }
+                            est = Pipeline(pipe_steps)
+                            est.set_params(**params)
+                            m = evaluate_model(est, Xfull, yfull, splitter)
+                            return -m["RMSE"]
+
+                        study = optuna.create_study(direction="minimize")
+                        study.optimize(objective, n_trials=n_opt_trials)
+
+                        best_params = study.best_params
+                        final_pipe = Pipeline(pipe_steps)
+                        final_pipe.set_params(**best_params)
+
+                        metrics = evaluate_model(final_pipe, Xfull, yfull, splitter)
+
+                        preds_opt = final_pipe.predict(Xfull.fillna(Xfull.mean()))
+                        std_pred = float(np.std(preds_opt))
+
+                        results_rows.append({
+                            "scenario": scen_name,
+                            "model": model_name,
+                            "optimiser": "Optuna",
+                            "split": split_name,
+                            "params": json.dumps(best_params),
+                            **metrics,
+                            "std_obs": std_obs,
+                            "std_pred": std_pred,
+                        })
+
+                    except Exception as e:
+                        print(f"Optuna error: {e}")
+
+    return pd.DataFrame(results_rows)
+
+
+###############################################################################
+# 8) RETRAIN BEST MODEL AND IMPUTE FULL SERIES
+###############################################################################
+
+def extract_feature_importance(pipe: Pipeline, feature_names: List[str]) -> pd.DataFrame:
+    """
+    Extract feature importance for ANY model inside the pipeline.
+
+    - Tree-based models: feature_importances_
+    - SelectKBest: fs.scores_
+    - Linear models: coef_
+    - Fallback: NaN vector
+    """
+
+    model = pipe.named_steps.get("model", None)
+    fs = pipe.named_steps.get("fs", None)
+
+    # 1. Tree-based models
+    if hasattr(model, "feature_importances_"):
+        imp = model.feature_importances_
+        return pd.DataFrame({"feature": feature_names, "importance": imp})
+
+    # 2. SelectKBest
+    if fs is not None and hasattr(fs, "scores_"):
+        imp = fs.scores_
+        return pd.DataFrame({"feature": feature_names, "importance": imp})
+
+    # 3. Linear models
+    if hasattr(model, "coef_"):
+        coef = model.coef_
+        if coef.ndim > 1:
+            coef = coef.ravel()
+        return pd.DataFrame({"feature": feature_names, "importance": coef})
+
+    # 4. Nothing available
+    return pd.DataFrame({"feature": feature_names, "importance": np.nan})
+
+
+def retrain_and_impute(
+    best_config: Tuple[str, str, str],
+    scenarios: Dict[str, pd.DataFrame],
+    models: Dict[str, BaseEstimator],
+    splitters: Dict[str, BaseCrossValidator],
+    original_index: pd.DatetimeIndex,
+    original_series: pd.Series,
+    output_dir: str,
+) -> pd.Series:
+    """
+    Retrain the selected best model and impute the full series.
+
+    Saves:
+    - .pkl model
+    - predicted vs observed CSV
+    - feature importance CSV
+    """
+
+    scen_name, model_name, optimiser = best_config
+
+    print(f"\n🔵 Retraining best configuration:")
+    print(f"    Scenario  : {scen_name}")
+    print(f"    Model     : {model_name}")
+    print(f"    Optimiser : {optimiser}")
+
+    # Retrieve scenario matrix
+    Xmat = scenarios[scen_name]
+    X = Xmat.drop(columns=["target"])
+    y = Xmat["target"]
+
+    # Training window mask
+    train_mask = (X.index >= TRAIN_START) & (X.index <= TRAIN_END)
+    X_train = X.loc[train_mask]
+    y_train = y.loc[train_mask]
+
+    # Handle NaN values (IF/LOF have NaNs after outlier removal)
+    mask_valid = (~X_train.isna().any(axis=1)) & (~y_train.isna())
+    X_train = X_train.loc[mask_valid]
+    y_train = y_train.loc[mask_valid]
+
+    if X_train.empty or y_train.empty:
+        raise ValueError(
+            f"No valid training data after NaN removal for best config: {best_config}"
+        )
+
+    # Build final pipeline
+    needs_fs = model_name in ["KNN", "SVR", "RF"]
+
+    pipe_steps = []
+    pipe_steps.append(("imputer", SimpleImputer(strategy="mean")))
+
+    if needs_fs:
+        pipe_steps.append(("scaler", StandardScaler()))
+        pipe_steps.append(("fs", SelectKBest(score_func=f_regression, k="all")))
+
+    pipe_steps.append(("model", models[model_name]))
+
+    pipe = Pipeline(pipe_steps)
+
+    # Fit model
+    pipe.fit(X_train, y_train)
+
+    # Save model
+    from pathlib import Path
+    import joblib
+    outdir = Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    model_path = outdir / f"best_model_{scen_name}_{model_name}_{optimiser}.pkl"
+    joblib.dump(pipe, model_path)
+
+    # Predict for ALL DATES
+    X_full = X.copy()
+    # Replace NaN in features for prediction
+    X_full = X_full.fillna(X_full.mean())
+
+    y_pred_full = pipe.predict(X_full)
+
+    # Build imputed series
+    imputed = pd.Series(y_pred_full, index=X.index)
+
+    # Save predicted vs observed CSV
+    obs_aligned = original_series.reindex(X.index)
+
+    df_pred_obs = pd.DataFrame({
+        "date": X.index,
+        "observed": obs_aligned.values,
+        "predicted": imputed.values,
+        "scenario": scen_name,
+        "model": model_name,
+        "optimiser": optimiser,
+    })
+
+    df_pred_obs.to_csv(
+        outdir / f"predicted_vs_observed_{scen_name}_{model_name}_{optimiser}.csv",
+        index=False
+    )
+
+    # Feature importance
+    try:
+        fi = extract_feature_importance(pipe, list(X.columns))
+        fi["scenario"] = scen_name
+        fi["model"] = model_name
+        fi["optimiser"] = optimiser
+        fi.to_csv(
+            outdir / f"feature_importance_{scen_name}_{model_name}_{optimiser}.csv",
+            index=False
+        )
+        print("   ✔ Feature importance saved.")
+    except Exception as e:
+        print(f"   ⚠ Could not extract feature importance. Error: {e}")
+
+    print("   ✔ Retrain + Imputation complete.")
+
+    return imputed
+
+###############################################################################
+# 9) FEATURE IMPORTANCE – GLOBAL AGGREGATION
+###############################################################################
+
+def aggregate_feature_importance(output_root: str = OUTPUT_ROOT) -> pd.DataFrame:
+    """
+    Aggregate all feature importance CSV files generated during retraining
+    into a single master table.
+
+    It searches recursively under OUTPUT_ROOT for files named:
+        'feature_importance_*.csv'
+
+    and concatenates them into:
+        'feature_importance_all.csv'
+
+    Returns
+    -------
+    DataFrame
+        Aggregated feature importance table with an extra 'source_file' column.
+    """
+    from pathlib import Path
+
+    root = Path(output_root)
+    fi_files = list(root.rglob("feature_importance_*.csv"))
+    frames: List[pd.DataFrame] = []
+
+    if not fi_files:
+        print("\n⚠ No feature importance CSV files found under", root)
+        return pd.DataFrame()
+
+    print("\n📊 Aggregating feature importance from CSV files:")
+    for f in fi_files:
+        try:
+            df = pd.read_csv(f)
+            df["source_file"] = str(f.relative_to(root))
+            frames.append(df)
+            print(f"   • {f.relative_to(root)}  (rows={len(df)})")
+        except Exception as e:
+            print(f"   ⚠ Could not read {f}: {e}")
+
+    if not frames:
+        print("\n⚠ No valid feature importance data could be read.")
+        return pd.DataFrame()
+
+    fi_all = pd.concat(frames, ignore_index=True)
+    out_path = root / "feature_importance_all.csv"
+    fi_all.to_csv(out_path, index=False)
+
+    print(f"\n✔ Aggregated feature importance saved to: {out_path}")
+    return fi_all
+
+
+###############################################################################
+# 10) MULTI-OBJECTIVE SELECTION – PARETO FRONT + BORDA RANKING
+###############################################################################
+
+def is_pareto_efficient(df: pd.DataFrame) -> np.ndarray:
+    """
+    Identify Pareto-efficient solutions.
+    Minimization problems:
+        - RMSE
+    Maximization problems:
+        - KGE
+
+    Returns
+    -------
+    np.ndarray(bool):
+        Boolean mask indicating Pareto-efficient rows.
+    """
+    values = df[["RMSE", "KGE"]].values
+
+    # Clean NaN rows
+    mask_valid = ~np.isnan(values).any(axis=1)
+    values_valid = values[mask_valid]
+
+    if len(values_valid) == 0:
+        return np.zeros(len(df), dtype=bool)
+
+    efficient = np.ones(values_valid.shape[0], dtype=bool)
+    for i in range(values_valid.shape[0]):
+        for j in range(values_valid.shape[0]):
+            if (
+                values_valid[j][0] <= values_valid[i][0] and
+                values_valid[j][1] >= values_valid[i][1] and
+                (values_valid[j][0] < values_valid[i][0] or
+                 values_valid[j][1] > values_valid[i][1])
+            ):
+                efficient[i] = False
+                break
+
+    # Expand mask
+    full_mask = np.zeros(len(df), dtype=bool)
+    full_mask[np.where(mask_valid)[0][efficient]] = True
+    return full_mask
+
+
+def pareto_borda_ranking(results_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Perform:
+    1. Pareto front extraction using RMSE (min) and KGE (max)
+    2. Borda count ranking across the two metrics
+
+    Returns
+    -------
+    DataFrame
+        ranked table with:
+        - scenario, model, optimiser
+        - RMSE, KGE, r, NSE, etc.
+        - pareto_front flag
+        - borda_score
+        - rank
+    """
+
+    df = results_df.copy()
+
+    # Compute Pareto front
+    df["pareto_front"] = is_pareto_efficient(df)
+
+    # Compute Borda scores
+    # Lower RMSE = better → inverse rank
+    df["rank_rmse"] = df["RMSE"].rank(ascending=True, method="dense")
+    # Higher KGE = better
+    df["rank_kge"] = df["KGE"].rank(ascending=False, method="dense")
+
+    # Borda = sum of ranks
+    df["borda_score"] = df["rank_rmse"] + df["rank_kge"]
+
+    # Final ranking
+    df["rank"] = df["borda_score"].rank(ascending=True, method="dense")
+
+    df = df.sort_values("rank")
+
+    return df
+
+
+def save_pareto_borda_tables(
+    target_name: str,
+    agg_df: pd.DataFrame,
+    output_root: str = OUTPUT_ROOT
+) -> Tuple[pd.DataFrame, Tuple[str, str, str]]:
+    """
+    Save aggregated results + Pareto–Borda ranking table.
+
+    Also returns:
+        best_config = (scenario, model, optimiser)
+    """
+
+    from pathlib import Path
+    outdir = Path(output_root) / target_name
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Apply ranking
+    ranked = pareto_borda_ranking(agg_df)
+
+    # Save both tables
+    agg_path = outdir / f"aggregated_results_{target_name}.csv"
+    rank_path = outdir / f"pareto_borda_ranking_{target_name}.csv"
+
+    agg_df.to_csv(agg_path, index=False)
+    ranked.to_csv(rank_path, index=False)
+
+    print(f"\n📊 Saved aggregated metrics → {agg_path}")
+    print(f"🏆 Saved Pareto–Borda ranking → {rank_path}")
+
+    # Extract best solution
+    best_row = ranked.iloc[0]
+    best_config = (
+        str(best_row["scenario"]),
+        str(best_row["model"]),
+        str(best_row["optimiser"]),
+    )
+
+    print(f"\n🏅 BEST MODEL FOR {target_name}:")
+    print(f"   Scenario : {best_config[0]}")
+    print(f"   Model    : {best_config[1]}")
+    print(f"   Optimiser: {best_config[2]}")
+
+    return ranked, best_config
+
+###############################################################################
+# 11) MANN–WHITNEY + CLIFF’S DELTA (COMPARISON OF SCENARIOS AND SERIES TYPES)
+###############################################################################
+
+from pathlib import Path
+from scipy.stats import mannwhitneyu
+
+
+def cliffs_delta(a, b):
+    """Compute Cliff's Delta effect size."""
+    a = np.array(a)
+    b = np.array(b)
+    total = len(a) * len(b)
+    greater = sum(x > y for x in a for y in b)
+    less = sum(x < y for x in a for y in b)
+    return (greater - less) / total if total > 0 else np.nan
+
+
+def mann_whitney_and_cliff(results_df: pd.DataFrame,
+                           target_name: str,
+                           output_root: str = "outputs_rainfall_imputation"):
+    """
+    Run statistical comparisons for:
+        1. U vs M_raw
+        2. U vs M_qm
+        3. original vs IF
+        4. original vs LOF
+        5. IF vs LOF
+    """
+
+    print(f"\n📊 Running Mann–Whitney + Cliff’s Delta for {target_name} ...")
+
+    # ------------------------------------------------------------
+    # Prepare output directory
+    # ------------------------------------------------------------
+    out_dir = Path(output_root) / target_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------
+    # Required columns
+    # ------------------------------------------------------------
+    required = ["scenario", "target_series", "KGE", "RMSE"]
+    for col in required:
+        if col not in results_df.columns:
+            raise ValueError(f"Missing required column in results_df: {col}")
+
+    records = []
+
+    # ------------------------------------------------------------
+    # Group definitions
+    # ------------------------------------------------------------
+    # Scenario categories
+    U_group     = results_df[results_df["scenario"].str.contains("U")]
+    M_raw_group = results_df[results_df["scenario"].str.contains("M_raw")]
+    M_qm_group  = results_df[results_df["scenario"].str.contains("M_qm")]
+
+    # Series types
+    orig = results_df[results_df["target_series"] == "original"]
+    IF   = results_df[results_df["target_series"] == "IF"]
+    LOF  = results_df[results_df["target_series"] == "LOF"]
+
+    # ------------------------------------------------------------
+    # Helper function for tests
+    # ------------------------------------------------------------
+    def add_test(label, df1, df2):
+        for metric in ["RMSE", "KGE"]:
+            a = df1[metric].dropna()
+            b = df2[metric].dropna()
+            if len(a) == 0 or len(b) == 0:
+                continue
+
+            stat, pval = mannwhitneyu(a, b, alternative="two-sided")
+            delta = cliffs_delta(a, b)
+
+            records.append({
+                "Comparison": label,
+                "Metric": metric,
+                "MW_stat": stat,
+                "MW_pvalue": pval,
+                "Cliffs_delta": delta,
+                "n_group1": len(a),
+                "n_group2": len(b),
+            })
+
+    # ------------------------------------------------------------
+    # SCENARIO COMPARISONS
+    # ------------------------------------------------------------
+    add_test("U vs M_raw", U_group, M_raw_group)
+    add_test("U vs M_qm",  U_group, M_qm_group)
+    add_test("M_raw vs M_qm", M_raw_group, M_qm_group)
+
+    # ------------------------------------------------------------
+    # SERIES TYPE COMPARISONS
+    # ------------------------------------------------------------
+    add_test("original vs IF",  orig, IF)
+    add_test("original vs LOF", orig, LOF)
+    add_test("IF vs LOF",        IF, LOF)
+
+    # ------------------------------------------------------------
+    # SAVE RESULTS
+    # ------------------------------------------------------------
+    res_df = pd.DataFrame(records)
+
+    out_path = out_dir / f"statistical_tests_{target_name}.csv"
+    res_df.to_csv(out_path, index=False)
+
+    print(f"✔ Statistical tests saved → {out_path}")
+    return res_df
+
+###############################################################################
+# 12) OUTPUT WRITERS – STANDARDIZED FILE SAVING FUNCTIONS
+###############################################################################
+
+def save_dataframe(df: pd.DataFrame, path: str):
+    """Save a DataFrame with safe error handling."""
+    try:
+        df.to_csv(path, index=False)
+        print(f"   ✔ Saved: {path}")
+    except Exception as e:
+        print(f"   ⚠ Could not save {path}: {e}")
+
+
+def save_json(obj: dict, path: str):
+    """Save dictionary or object as JSON."""
+    try:
+        with open(path, "w") as f:
+            json.dump(obj, f, indent=2)
+        print(f"   ✔ Saved JSON: {path}")
+    except Exception as e:
+        print(f"   ⚠ JSON save error for {path}: {e}")
+
+
+def consolidate_series_to_csv(
+    targets_dict: Dict[str, pd.Series],
+    raw_exog: pd.DataFrame,
+    qm_exog: pd.DataFrame,
+    output_root: str = OUTPUT_ROOT
+) -> pd.DataFrame:
+    """
+    Build a unified table with:
+        - all target series
+        - raw exogenous series
+        - QM-corrected exogenous series
+
+    And save it to:
+        all_series_raw_qm.csv
+
+    Useful for reproducibility and plotting.
+    """
+    print("\n📦 Consolidating ALL series (targets + RAW exog + QM exog)...")
+
+    df = pd.DataFrame(index=raw_exog.index)
+
+    # Add target series
+    for name, ser in targets_dict.items():
+        df[name] = ser.reindex(df.index)
+
+    # Add exogenous RAW
+    for col in raw_exog.columns:
+        df[f"RAW__{col}"] = raw_exog[col]
+
+    # Add exogenous QM
+    for col in qm_exog.columns:
+        df[f"QM__{col}"] = qm_exog[col]
+
+    out_path = f"{output_root}/all_series_raw_qm.csv"
+    save_dataframe(df, out_path)
+
+    return df
+
+
+def save_final_imputed_series(
+    target_name: str,
+    imputed_series: pd.Series,
+    output_root: str = OUTPUT_ROOT
+):
+    """
+    Save final imputed series as:
+        imputed_<target>.csv
+    """
+
+    df = pd.DataFrame({
+        "date": imputed_series.index,
+        "imputed": imputed_series.values
+    })
+
+    out_path = f"{output_root}/{target_name}/imputed_{target_name}.csv"
+    save_dataframe(df, out_path)
+
+
+###############################################################################
+# 12.1) OPTIONAL POST-PROCESSING REFINEMENT (MISSFOREST / MICE)
+###############################################################################
+
+# ---> MissForest refinement (recommended)
+def refine_with_missforest(series):
+    """
+    Apply missForest refinement AFTER ML imputation.
+    The input series must be fully imputed (no NaNs).
+    Output: refined series with small local corrections.
+    """
+    try:
+        from missingpy import MissForest
+    except ImportError:
+        raise ImportError("Install missingpy: pip install missingpy")
+
+    df = pd.DataFrame({"rain": series.values})
+    imputer = MissForest(
+        max_iter=10,
+        n_estimators=200,
+        random_state=42
+    )
+    refined = imputer.fit_transform(df)
+    return pd.Series(refined[:, 0], index=series.index)
+
+
+# ---> Optional MICE refinement
+def refine_with_mice(series):
+    """
+    MICE refinement. Tends to smooth more than missForest.
+    """
+    from sklearn.experimental import enable_iterative_imputer
+    from sklearn.impute import IterativeImputer
+
+    df = pd.DataFrame({"rain": series.values})
+    imputer = IterativeImputer(
+        max_iter=20,
+        random_state=42,
+        sample_posterior=False
+    )
+    refined = imputer.fit_transform(df)
+    return pd.Series(refined[:, 0], index=series.index)
+
+
+
+###############################################################################
+# 13) MAIN WORKFLOW
+###############################################################################
+
+def main():
+    np.random.seed(SEED)
+
+    from pathlib import Path
+    Path(OUTPUT_ROOT).mkdir(parents=True, exist_ok=True)
+
+    print("\n================ RAINFALL ML IMPUTATION – START ================\n")
+
+    # ---------------------------------------------------------------
+    # 1) LOAD DATA
+    # ---------------------------------------------------------------
+    print("📥 Loading rainfall and exogenous data...")
+
+    rain_df = read_daily_excel(RAIN_PATH)
+    exog_df = read_daily_excel(EXOG_PATH)
+
+    # Alinear índices
+    common_index = rain_df.index.union(exog_df.index)
+    rain_df = rain_df.reindex(common_index)
+    exog_df = exog_df.reindex(common_index)
+
+    # Definir series objetivo (todas las columnas de lluvia excepto la fecha)
+    target_cols = list(rain_df.columns)
+
+    print(f"   ✔ Targets found: {target_cols}")
+
+    # ---------------------------------------------------------------
+    # 2) SUMMARY STATISTICS
+    # ---------------------------------------------------------------
+    print("\n📊 Computing dataset statistics...")
+    stats_df = dataset_statistics(
+        rain_df,
+        target_cols=target_cols,
+        train_start=TRAIN_START,
+        train_end=TRAIN_END,
+    )
+    stats_path = Path(OUTPUT_ROOT) / "dataset_statistics.csv"
+    stats_df.to_csv(stats_path, index=False)
+    print(f"   ✔ Saved statistics → {stats_path}")
+
+    # ---------------------------------------------------------------
+    # 3) TRAINING INDEX & QUANTILE MAPPING
+    # ---------------------------------------------------------------
+    print("\n⚙ Preparing training window and quantile mapping...")
+
+    train_index = rain_df.loc[TRAIN_START:TRAIN_END].index
+
+    # Asegurarnos que INMET está disponible
+    if "INMET" not in exog_df.columns:
+        raise ValueError("INMET column not found in exogenous DataFrame.")
+
+    qm_dict = apply_quantile_mapping(
+        exog_df=exog_df,
+        reference=exog_df["INMET"],
+        train_index=train_index,
+        exog_products=EXOG_PRODUCTS,
+    )
+
+    # DataFrames de exógenas RAW y QM (para features)
+    full_index = rain_df.index
+    raw_exog_feats, qm_exog_feats = build_exogenous_features(
+        exog_df=exog_df,
+        exog_products=EXOG_PRODUCTS,
+        qm_dict=qm_dict,
+        full_index=full_index,
+    )
+
+    # DataFrame de series exógenas QM (sin lags) para consolidación
+    qm_exog_series = pd.DataFrame(index=exog_df.index)
+    for name, ser in qm_dict.items():
+        qm_exog_series[name] = ser
+
+    # ---------------------------------------------------------------
+    # 4) SETUP MODELS AND CV SPLITTERS
+    # ---------------------------------------------------------------
+    print("\n🤖 Initializing models and cross-validation splitters...")
+
+    models: Dict[str, BaseEstimator] = {
+        "KNN": KNeighborsRegressor(),
+        "SVR": SVR(),
+        "RF": RandomForestRegressor(
+            n_estimators=200,
+            random_state=SEED,
+            n_jobs=-1,
+        ),
+        "XGB": XGBRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=SEED,
+            n_jobs=-1,
+        ),
+        "CAT": CatBoostRegressor(
+            depth=6,
+            learning_rate=0.05,
+            iterations=500,
+            random_state=SEED,
+            verbose=False,
+        ),
+    }
+
+    splitters = get_cv_splitters(
+        index=train_index,
+        hyd_enabled=True,
+        n_splits=5,
+    )
+
+    # ---------------------------------------------------------------
+    # 5) LOOP OVER TARGET SERIES
+    # ---------------------------------------------------------------
+    print("\n🚀 Starting modelling for each target series...\n")
+
+    all_results = []
+    imputations: Dict[str, pd.Series] = {}
+
+    for target in target_cols:
+        print("\n===================================================")
+        print(f"   TARGET SERIES: {target}")
+        print("===================================================\n")
+
+        y = rain_df[target]
+
+        # -------------------------
+        # 5.1 Endogenous features
+        # -------------------------
+        endo_df = build_daily_features(y)
+
+        # -------------------------
+        # 5.2 Scenarios (U, M-RAW, M-QM)
+        # -------------------------
+        scenarios = build_scenarios(
+            y=y,
+            endogenous_df=endo_df,
+            raw_exog_df=raw_exog_feats,
+            qm_exog_df=qm_exog_feats,
+            exog_products=EXOG_PRODUCTS,
+        )
+
+        # -------------------------
+        # 5.3 Train & evaluate
+        # -------------------------
+        results_target = []
+
+        for scen_name, scen_df in scenarios.items():
+            res_scen = train_and_evaluate_scenario(
+                scen_name=scen_name,
+                scen_df=scen_df,
+                models=models,
+                splitters=splitters,
+                use_fs=True,
+                use_grid=USE_GRID,
+                use_random=USE_RANDOM,
+                use_optuna=USE_OPTUNA,
+                n_random_iter=N_RANDOM_ITER,
+                n_opt_trials=N_OPTUNA_TRIALS,
+            )
+            if not res_scen.empty:
+                res_scen["target_series"] = target
+                results_target.append(res_scen)
+
+        if not results_target:
+            print(f"⚠ No results for target {target}, skipping Pareto–Borda and imputation.")
+            continue
+
+        results_target_df = pd.concat(results_target, ignore_index=True)
+        all_results.append(results_target_df)
+
+        # Guardar resultados de esta serie
+        target_res_path = Path(OUTPUT_ROOT) / target / f"all_results_{target}.csv"
+        target_res_path.parent.mkdir(parents=True, exist_ok=True)
+        results_target_df.to_csv(target_res_path, index=False)
+        print(f"\n✔ Saved per-target results → {target_res_path}")
+
+        # -------------------------
+        # 5.4 Pareto–Borda ranking
+        # -------------------------
+        ranked, best_config = save_pareto_borda_tables(
+            target_name=target,
+            agg_df=results_target_df,
+            output_root=OUTPUT_ROOT,
+        )
+
+        # ---------------------------------------------------------
+        # 5.4.1 Extract TOP-3 best models for feature importance
+        # ---------------------------------------------------------
+        print("\n⭐ Extracting TOP-3 best models for feature importance...")
+
+        # ranked viene de save_pareto_borda_tables()
+        top3 = ranked.head(3).copy()
+
+        # Directory for saving FI of top-3
+        fi_top3_dir = Path(OUTPUT_ROOT) / target / "feature_importance_top3"
+        fi_top3_dir.mkdir(parents=True, exist_ok=True)
+
+        top3_fi_paths = []
+
+        for i, row in top3.iterrows():
+            scen_i      = str(row["scenario"])
+            model_i     = str(row["model"])
+            optim_i     = str(row["optimiser"])
+
+            print(f"\n   🔹 TOP-{i+1}: {scen_i} | {model_i} | {optim_i}")
+
+            # ===== Retrain model for feature importance (no imputation)
+            scen_df_i = scenarios[scen_i]
+            Xmat_i = scen_df_i.drop(columns=["target"])
+            y_i = scen_df_i["target"]
+
+            # Training window only
+            train_mask_i = (Xmat_i.index >= TRAIN_START) & (Xmat_i.index <= TRAIN_END)
+            Xtrain_i = Xmat_i.loc[train_mask_i]
+            ytrain_i = y_i.loc[train_mask_i]
+
+            # Remove rows with NaNs
+            mask_valid_i = (~Xtrain_i.isna().any(axis=1)) & (~ytrain_i.isna())
+            Xtrain_i = Xtrain_i.loc[mask_valid_i]
+            ytrain_i = ytrain_i.loc[mask_valid_i]
+
+            if Xtrain_i.empty:
+                print("   ⚠ No valid training rows for FI of this model.")
+                continue
+
+            # Build pipeline for selected model
+            needs_fs_i = model_i in ["KNN", "SVR", "RF"]
+
+            steps_i = [("imputer", SimpleImputer(strategy="mean"))]
+            if needs_fs_i:
+                steps_i.append(("scaler", StandardScaler()))
+                steps_i.append(("fs", SelectKBest(score_func=f_regression, k="all")))
+            steps_i.append(("model", models[model_i]))
+
+            pipe_i = Pipeline(steps_i)
+            pipe_i.fit(Xtrain_i, ytrain_i)
+
+            # Feature importance extraction
+            try:
+                fi_i = extract_feature_importance(pipe_i, list(Xtrain_i.columns))
+                fi_i["scenario"]  = scen_i
+                fi_i["model"]     = model_i
+                fi_i["optimiser"] = optim_i
+                fi_i["rank_top"]  = i+1
+
+                out_csv_i = fi_top3_dir / f"feature_importance_top{i+1}_{scen_i}_{model_i}_{optim_i}.csv"
+                fi_i.to_csv(out_csv_i, index=False)
+                top3_fi_paths.append(str(out_csv_i))
+
+                print(f"      ✔ Saved feature importance → {out_csv_i}")
+
+            except Exception as e:
+                print(f"      ⚠ Could not extract FI for TOP-{i+1} model. Error: {e}")
+
+        # -------------------------
+        # 5.5 Retrain best model & impute full series
+        # -------------------------
+        imputed_series = retrain_and_impute(
+            best_config=best_config,
+            scenarios=scenarios,
+            models=models,
+            splitters=splitters,
+            original_index=y.index,
+            original_series=y,
+            output_dir=os.path.join(OUTPUT_ROOT, target),
+        )
+
+        imputations[target] = imputed_series
+
+        # Guardar serie imputada final
+        save_final_imputed_series(
+            target_name=target,
+            imputed_series=imputed_series,
+            output_root=OUTPUT_ROOT,
+        )
+
+    # ===============================================================
+    # 5.6 OPTIONAL POST-PROCESSING REFINEMENT (MISSFOREST)
+    # ===============================================================
+    
+    print("\n✨ Applying optional post-processing refinement (MissForest)...")
+    
+    try:
+        refined_series = refine_with_missforest(imputed_series)
+        
+        # Save refined series
+        refined_path = f"{OUTPUT_ROOT}/{target}/imputed_{target}_REFINED_missforest.csv"
+        refined_df = pd.DataFrame({
+            "date": refined_series.index,
+            "imputed_refined": refined_series.values
+        })
+        refined_df.to_csv(refined_path, index=False)
+    
+        print(f"   ✔ Refinement saved → {refined_path}")
+    
+    except Exception as e:
+        print(f"   ⚠ Refinement skipped (error): {e}")
+
+    # ---------------------------------------------------------------
+    # 6) GLOBAL RESULTS CONSOLIDATION
+    # ---------------------------------------------------------------
+    if all_results:
+        print("\n📚 Consolidating ALL model results (all targets + scenarios)...")
+        results_all = pd.concat(all_results, ignore_index=True)
+
+        all_res_path = Path(OUTPUT_ROOT) / "all_results_all_targets.csv"
+        results_all.to_csv(all_res_path, index=False)
+        print(f"   ✔ Saved → {all_res_path}")
+    else:
+        print("\n⚠ No modelling results found. Exiting.")
+        return
+
+    # ---------------------------------------------------------------
+    # 7) CONSOLIDATED SERIES TABLE (TARGETS + EXOG RAW + QM)
+    # ---------------------------------------------------------------
+    targets_dict = {name: rain_df[name] for name in target_cols}
+    consolidate_series_to_csv(
+        targets_dict=targets_dict,
+        raw_exog=exog_df,
+        qm_exog=qm_exog_series,
+        output_root=OUTPUT_ROOT,
+    )
+
+    # ---------------------------------------------------------------
+    # 8) GLOBAL FEATURE IMPORTANCE AGGREGATION
+    # ---------------------------------------------------------------
+    aggregate_feature_importance(OUTPUT_ROOT)
+
+    # ---------------------------------------------------------------
+    # 8.2) COMPARACIÓN TOP-15 ENTRE MODELOS (BARPLOT AGRUPADO)
+    # ---------------------------------------------------------------
+    print("\n📊 Generating grouped TOP-15 comparison across models...")
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    fi_all_path = Path(OUTPUT_ROOT) / "feature_importance_all.csv"
+    if fi_all_path.exists():
+        fi_all = pd.read_csv(fi_all_path)
+
+        required_cols = {"feature", "importance", "scenario", "model", "optimiser"}
+        if not required_cols.issubset(set(fi_all.columns)):
+            print("⚠ Missing columns in feature_importance_all.csv. Skipping B.")
+        else:
+            out_dir = Path(OUTPUT_ROOT) / "feature_plots_grouped"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            # Normalizar importancias dentro de cada modelo
+            fi_all["importance_norm"] = fi_all.groupby(
+                ["scenario", "model", "optimiser"]
+            )["importance"].transform(
+                lambda x: x / (x.max() if x.max() != 0 else 1)
+            )
+
+            for scen, df_scen in fi_all.groupby("scenario"):
+
+                # Obtener los features más frecuentes dentro del TOP-15 de todos los modelos
+                top_features = (
+                    df_scen.sort_values("importance", ascending=False)
+                    .groupby(["model", "optimiser"])
+                    .head(15)["feature"]
+                )
+
+                top_features_unique = top_features.value_counts().head(15).index.tolist()
+
+                df_plot = df_scen[df_scen["feature"].isin(top_features_unique)]
+
+                plt.figure(figsize=(16, 9))
+                sns.barplot(
+                    data=df_plot,
+                    x="feature",
+                    y="importance_norm",
+                    hue="model",
+                )
+                plt.xticks(rotation=70)
+                plt.ylabel("Normalized Importance")
+                plt.title(f"Top-15 Feature Comparison Across Models – {scen}")
+                plt.tight_layout()
+
+                fig_path = out_dir / f"TOP15_grouped_{scen}.png"
+                plt.savefig(fig_path, dpi=300)
+                plt.close()
+
+                print(f"   ✔ Saved: {fig_path}")
+
+    else:
+        print("⚠ feature_importance_all.csv not found. Skipping B.")
+
+
+
+    # ---------------------------------------------------------------
+    # 8.2) COMPARACIÓN TOP-15 ENTRE MODELOS (BARPLOT AGRUPADO)
+    # ---------------------------------------------------------------
+    print("\n📊 Generating grouped TOP-15 comparison across models...")
+
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    fi_all_path = Path(OUTPUT_ROOT) / "feature_importance_all.csv"
+    if fi_all_path.exists():
+        fi_all = pd.read_csv(fi_all_path)
+
+        required_cols = {"feature", "importance", "scenario", "model", "optimiser"}
+        if not required_cols.issubset(set(fi_all.columns)):
+            print("⚠ Missing columns in feature_importance_all.csv. Skipping B.")
+        else:
+            out_dir = Path(OUTPUT_ROOT) / "feature_plots_grouped"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            # Normalizar importancias dentro de cada modelo
+            fi_all["importance_norm"] = fi_all.groupby(
+                ["scenario", "model", "optimiser"]
+            )["importance"].transform(
+                lambda x: x / (x.max() if x.max() != 0 else 1)
+            )
+
+            for scen, df_scen in fi_all.groupby("scenario"):
+
+                # Obtener los features más frecuentes dentro del TOP-15 de todos los modelos
+                top_features = (
+                    df_scen.sort_values("importance", ascending=False)
+                    .groupby(["model", "optimiser"])
+                    .head(15)["feature"]
+                )
+
+                top_features_unique = top_features.value_counts().head(15).index.tolist()
+
+                df_plot = df_scen[df_scen["feature"].isin(top_features_unique)]
+
+                plt.figure(figsize=(16, 9))
+                sns.barplot(
+                    data=df_plot,
+                    x="feature",
+                    y="importance_norm",
+                    hue="model",
+                )
+                plt.xticks(rotation=70)
+                plt.ylabel("Normalized Importance")
+                plt.title(f"Top-15 Feature Comparison Across Models – {scen}")
+                plt.tight_layout()
+
+                fig_path = out_dir / f"TOP15_grouped_{scen}.png"
+                plt.savefig(fig_path, dpi=300)
+                plt.close()
+
+                print(f"   ✔ Saved: {fig_path}")
+
+    else:
+        print("⚠ feature_importance_all.csv not found. Skipping B.")
+
+    # ---------------------------------------------------------------
+    # 9) GLOBAL STATISTICAL TESTS (U vs M, RAW vs QM, COMPLETE vs IF vs LOF)
+    # ---------------------------------------------------------------
+    print("\n🧪 Running global statistical comparisons (all series)...")
+
+    # Hack ligero: duplicamos el DataFrame para no tocar el original
+    df_stats = results_all.copy()
+
+    # Para permitir que la Sección 11 detecte IF/LOF por nombre,
+    # concatenamos el nombre de la serie al escenario
+    df_stats["scenario"] = df_stats["scenario"].astype(str) + "_" + df_stats["target_series"].astype(str)
+
+    mann_whitney_and_cliff(
+        results_df=df_stats,
+        target_name="ALL_SERIES",
+        output_root=OUTPUT_ROOT,
+    )
+
+    print("\n================ RAINFALL ML IMPUTATION – DONE ================\n")
+
+
+if __name__ == "__main__":
+    main()
+
+#%%
+####################################################################
+# GRAPHICS
+###################################################################
+# -*- coding: utf-8 -*-
+#%%
+"""
+Figures for rainfall ML imputation – Nature-style
+All figures saved under: outputs_rainfall_imputation/Figures
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from statsmodels.tsa.seasonal import STL
+
+# =============================================================================
+# 0. GLOBAL PATHS AND STYLE
+# =============================================================================
+
+BASE = Path("outputs_rainfall_imputation")
+
+FIG_DIR = BASE / "Figures"
+FIG_DIR.mkdir(exist_ok=True)
+
+FIG_IMPUT = FIG_DIR / "Imputation"
+FIG_IMPUT.mkdir(exist_ok=True)
+
+# --- Nature-like global style ---
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 11,
+    "axes.titlesize": 13,
+    "axes.labelsize": 12,
+    "axes.linewidth": 0.8,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+})
+
+# Color palettes
+nature_colors_products = {
+    "ERA5":         "#0072B2",
+    "ERA5land":     "#D55E00",
+    "CHIRPS":       "#009E73",
+    "PERSIANN_CDR": "#CC79A7",
+    "INMET":        "#6A3D9A",  # nuevo color
+    "OTHER":        "gray",
+}
+
+nature_colors_series = {
+    "rain_original": "#1f77b4",
+    "Complete_IF":   "#2ca02c",
+    "Complete_LOF":  "#d62728",
+}
+
+marker_scenario = {
+    "U": "s",
+    "M_raw": "o",
+    "M_qm": "D",
+}
+
+marker_product = {
+    "U":            "*",
+    "ERA5":         "o",
+    "ERA5land":     "s",
+    "CHIRPS":       "d",
+    "PERSIANN_CDR": "^",
+    "INMET":        "X"   # ← NUEVO PARA M-INMET
+}
+
+
+corr_markers = {"RAW": "o", "QM": "s"}
+
+
+# =============================================================================
+# 1. LOAD CORE DATASETS
+# =============================================================================
+
+# Pareto–Borda rankings
+RANK_FILES = {
+    "rain_original": BASE / "rain_original/pareto_borda_ranking_rain_original.csv",
+    "Complete_IF":   BASE / "Complete_IF/pareto_borda_ranking_Complete_IF.csv",
+    "Complete_LOF":  BASE / "Complete_LOF/pareto_borda_ranking_Complete_LOF.csv",
+}
+
+rank_dfs = []
+for series, file in RANK_FILES.items():
+    df_r = pd.read_csv(file)
+    df_r["series_type"] = series
+    rank_dfs.append(df_r)
+
+df_rank_all = pd.concat(rank_dfs, ignore_index=True)
+
+# Global metrics per model / scenario / series
+df_all_results = pd.read_csv(BASE / "all_results_all_targets.csv")
+
+# Feature importance (3 best models)
+fi_path = BASE / "feature_importance_all.csv"
+if fi_path.exists():
+    df_fi = pd.read_csv(fi_path)
+else:
+    df_fi = pd.DataFrame()
+
+# =============================================================================
+# 2. SMALL HELPERS
+# =============================================================================
+
+def classify_scenario(s: str) -> str:
+    s = str(s)
+    if s.startswith("M-") and s.endswith("_QM"):
+        return "M_qm"
+    elif s.startswith("M-"):
+        return "M_raw"
+    else:
+        return "U"
+
+
+def detect_product(s: str) -> str:
+    su = str(s).upper()
+    if "INMET" in su:
+        return "INMET"
+    elif "ERA5LAND" in su:
+        return "ERA5land"
+    elif "ERA5" in su:
+        return "ERA5"
+    elif "CHIRPS" in su:
+        return "CHIRPS"
+    elif "PERSIANN" in su:
+        return "PERSIANN_CDR"
+    else:
+        return "OTHER"
+
+
+def detect_group_from_product(prod: str) -> str:
+    if prod in ["ERA5", "ERA5land"]:
+        return "Reanalysis"
+    elif prod in ["CHIRPS", "PERSIANN_CDR"]:
+        return "Satellite"
+    return "Other"
+
+
+def get_metrics_row(series: str, model: str, scenario: str):
+    sub = df_all_results[
+        (df_all_results["target_series"] == series)
+        & (df_all_results["model"] == model)
+        & (df_all_results["scenario"] == scenario)
+    ]
+    if sub.empty:
+        return None
+    row = sub.iloc[0]
+    if row.get("r", 0) <= 0:
+        return None
+    return row
+
+
+# =============================================================================
+# 3. FIGURE 01 – PARETO-BORDA ALL MODELS (SCATTER)
+# =============================================================================
+# uses: df_rank_all
+
+df_pb = df_rank_all.copy()
+
+# Normalized Borda (lower is better)
+df_pb["borda_norm"] = df_pb["borda_score"] / df_pb["borda_score"].max()
+df_pb["scenario_type"] = df_pb["scenario"].apply(classify_scenario)
+df_pb["product"] = df_pb["scenario"].apply(detect_product)
+
+plt.figure(figsize=(12, 8))
+
+for _, row in df_pb.iterrows():
+    size = 40 + row["borda_norm"] * 260
+    series_color = nature_colors_series.get(row["series_type"], "#555555")
+    #marker = marker_scenario.get(row["scenario_type"], "o")
+    # Marker por producto (incluye INMET)
+    marker = marker_product.get(row["product"], "o")
+
+    plt.scatter(
+        row["RMSE"],
+        row["KGE"],
+        s=size,
+        color=series_color,
+        marker=marker,
+        edgecolor="black",
+        linewidth=0.4,
+        alpha=0.85,
+    )
+
+# Legends
+import matplotlib.lines as mlines
+
+handles_series = [
+    mlines.Line2D([], [], color=col, marker='o', linestyle="None",
+                  markersize=9, label=ser)
+    for ser, col in nature_colors_series.items()
+]
+
+
+
+handles_prod = [
+    mlines.Line2D([], [], color="gray", marker=marker_product[p], linestyle="None",
+                  markersize=9, label=p)
+    for p in marker_product.keys()
+]
+
+
+handles_scen = [
+    mlines.Line2D([], [], color="black", marker=mk, linestyle="None",
+                  markersize=9, label=scen)
+    for scen, mk in marker_scenario.items()
+]
+
+
+plt.legend(handles_series + handles_prod,# + handles_scen,
+           list(nature_colors_series.keys()) +
+           #list(marker_scenario.keys()) +
+           list(marker_product.keys()),
+           title="Series / Product",
+           loc="lower right",
+           bbox_to_anchor=(0.98, 0.02),
+           frameon=True,
+           facecolor="white",
+           edgecolor="black",
+)
+
+
+plt.xlabel("RMSE (lower is better)")
+plt.ylabel("KGE (higher is better)")
+plt.title("KGE vs RMSE (All Models)\nSize = Borda score, Color = Series, Marker = Scenario")
+plt.grid(alpha=0.25)
+plt.tight_layout(rect=[0, 0, 0.85, 1])
+
+plt.savefig(FIG_DIR / "Figure_01_pareto_borda_all_models.png", dpi=350)
+plt.close()
+
+#%%
+
+# =============================================================================
+# 4. FIGURE 02 – SUBPLOTS BY SCENARIO (KGE > 0) + INMET SEPARADO
+# =============================================================================
+
+df_plot = df_pb[df_pb["KGE"] > 0].copy()
+
+# Nuevo conjunto de paneles:
+# 1) U
+# 2) M_raw sin INMET
+# 3) M_qm
+# 4) SOLO M-INMET
+panels = ["U", "M_raw_no_inmet", "M_qm", "M_inmet"]
+
+#fig, axes = plt.subplots(1, 4, figsize=(25, 6), sharex=True, sharey=True)
+
+fig, axes = plt.subplots(2, 2, figsize=(17, 12), sharex=True, sharey=True)
+axes = axes.flatten()   # para iterar igual que antes
+
+
+for ax, panel in zip(axes, panels):
+
+    if panel == "U":
+        sub = df_plot[df_plot["scenario_type"] == "U"]
+
+    elif panel == "M_raw_no_inmet":
+        sub = df_plot[
+            (df_plot["scenario_type"] == "M_raw") &
+            (df_plot["product"] != "INMET")
+        ]
+
+    elif panel == "M_qm":
+        sub = df_plot[df_plot["scenario_type"] == "M_qm"]
+
+    elif panel == "M_inmet":
+        sub = df_plot[
+            (df_plot["scenario_type"] == "M_raw") &
+            (df_plot["product"] == "INMET")
+        ]
+
+    for _, row in sub.iterrows():
+        size = 40 + row["borda_norm"] * 260
+        color = nature_colors_series.get(row["series_type"], "#555555")
+
+        # Mantenemos el marcador original por escenario
+        marker = marker_scenario.get(row["scenario_type"], "o")
+
+        ax.scatter(
+            row["RMSE"],
+            row["KGE"],
+            s=size,
+            color=color,
+            marker=marker,
+            edgecolor="black",
+            linewidth=0.4,
+            alpha=0.85,
+        )
+
+    title_map = {
+        "U": "(a) Univariate",
+        "M_raw_no_inmet": "(b) Multivariate RAW (ERA5 / CHIRPS / PERSIANN / ERA5land)",
+        "M_qm": "(c) Multivariate QM",
+        "M_inmet": "(d) INMET only (M-INMET)"
+    }
+    ax.set_title(title_map[panel])
+    ax.grid(alpha=0.25)
+
+axes[0].set_ylabel("KGE (higher is better)")
+for ax in axes:
+    ax.set_xlabel("RMSE (lower is better)")
+
+fig.suptitle("KGE vs RMSE by Scenario (KGE > 0)", fontsize=15)
+plt.tight_layout(rect=[0, 0, 1, 0.93])
+
+plt.savefig(FIG_DIR / "Figure_02_subplots_by_scenario_4panels.png", dpi=350)
+plt.close()
+
+#%%
+# =============================================================================
+# 4. FIGURE 02 – SUBPLOTS BY SCENARIO (KGE > 0)
+# =============================================================================
+
+df_plot = df_pb[df_pb["KGE"] > 0].copy()
+scenarios = ["U", "M_raw", "M_qm"]
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 6), sharex=True, sharey=True)
+
+for ax, scen in zip(axes, scenarios):
+    sub = df_plot[df_plot["scenario_type"] == scen]
+    for _, row in sub.iterrows():
+        size = 40 + row["borda_norm"] * 260
+        color = nature_colors_series.get(row["series_type"], "#555555")
+        marker = marker_scenario.get(row["scenario_type"], "o")
+
+        ax.scatter(
+            row["RMSE"],
+            row["KGE"],
+            s=size,
+            color=color,
+            marker=marker,
+            edgecolor="black",
+            linewidth=0.4,
+            alpha=0.85,
+        )
+
+    label = {"U": "(a) Univariate",
+             "M_raw": "(b) Multivariate RAW",
+             "M_qm": "(c) Multivariate QM"}[scen]
+    ax.set_title(label)
+    ax.grid(alpha=0.25)
+
+axes[0].set_ylabel("KGE (higher is better)")
+for ax in axes:
+    ax.set_xlabel("RMSE (lower is better)")
+
+fig.suptitle("KGE vs RMSE by Scenario (KGE > 0)", fontsize=14)
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+plt.savefig(FIG_DIR / "Figure_02_subplots_by_scenario.png", dpi=350)
+plt.close()
+
+#%%
+# =============================================================================
+# 5. FIGURE 03 – TAYLOR DIAGRAMS (TOP-3 PER SERIES, TOP-10 GLOBAL)
+# =============================================================================
+#%%
+# --- TaylorDiagram class (same as antes, estilo limpio) ---
+import numpy as NP
+import matplotlib.projections as proj
+
+class TaylorDiagram(object):
+    def __init__(self, refstd, fig=None, rect=111, label='_', srange=(0, 1.5), extend=False):
+        from matplotlib.projections import PolarAxes
+        import mpl_toolkits.axisartist.floating_axes as FA
+        import mpl_toolkits.axisartist.grid_finder as GF
+
+        self.refstd = refstd
+        tr = PolarAxes.PolarTransform()
+
+        rlocs = NP.array([0, 0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1])
+        if extend:
+            self.tmax = NP.pi
+            rlocs = NP.concatenate((-rlocs[:0:-1], rlocs))
+        else:
+            self.tmax = NP.pi / 2
+
+        tlocs = NP.arccos(rlocs)
+        gl1 = GF.FixedLocator(tlocs)
+        tf1 = GF.DictFormatter(dict(zip(tlocs, map(str, rlocs))))
+
+        self.smin = srange[0] * self.refstd
+        self.smax = srange[1] * self.refstd
+
+        ghelper = FA.GridHelperCurveLinear(
+            tr,
+            extremes=(0, self.tmax, self.smin, self.smax),
+            grid_locator1=gl1,
+            tick_formatter1=tf1
+        )
+
+        if fig is None:
+            fig = plt.figure()
+
+        ax = FA.FloatingSubplot(fig, rect, grid_helper=ghelper)
+        fig.add_subplot(ax)
+
+        ax.axis["top"].set_axis_direction("bottom")
+        ax.axis["top"].toggle(ticklabels=True, label=True)
+        ax.axis["top"].major_ticklabels.set_axis_direction("top")
+        ax.axis["top"].label.set_axis_direction("top")
+        ax.axis["top"].label.set_text("Correlation")
+
+        ax.axis["left"].set_axis_direction("bottom")
+        ax.axis["left"].label.set_text("Standard deviation")
+
+        ax.axis["right"].set_axis_direction("top")
+        ax.axis["right"].toggle(ticklabels=True)
+        ax.axis["right"].major_ticklabels.set_axis_direction("bottom")
+
+        if self.smin:
+            ax.axis["bottom"].toggle(ticklabels=False, label=False)
+        else:
+            ax.axis["bottom"].set_visible(False)
+
+        self._ax = ax
+        self.ax = ax.get_aux_axes(tr)
+
+        l, = self.ax.plot([0], self.refstd, 'k*', ms=10, label=label)
+
+        t = NP.linspace(0, self.tmax)
+        r = NP.zeros_like(t) + self.refstd
+        self.ax.plot(t, r, 'k--')
+
+        self.samplePoints = [l]
+
+    def add_sample(self, stddev, corrcoef, *args, **kwargs):
+        l, = self.ax.plot(NP.arccos(corrcoef), stddev, *args, **kwargs)
+        self.samplePoints.append(l)
+        return l
+
+    def add_grid(self, *args, **kwargs):
+        self._ax.grid(*args, **kwargs)
+
+    def add_contours(self, levels=5, **kwargs):
+        rs, ts = NP.meshgrid(NP.linspace(self.smin, self.smax),
+                             NP.linspace(0, self.tmax))
+        rms = NP.sqrt(self.refstd**2 + rs**2 - 2*self.refstd*rs*NP.cos(ts))
+        contours = self.ax.contour(ts, rs, rms, levels, **kwargs)
+        return contours
+
+
+# --- Top 3 per series (true Borda) ---
+taylor_data_series = []
+
+for series, file in RANK_FILES.items():
+    df_rank = pd.read_csv(file).sort_values("borda_score", ascending=True).head(3)
+    for _, row in df_rank.iterrows():
+        m = get_metrics_row(series, row["model"], row["scenario"])
+        if m is None:
+            continue
+        taylor_data_series.append({
+            "name": f"{series} | {row['model']} | {row['scenario']}",
+            "std_obs": m["std_obs"],
+            "std_pred": m["std_pred"],
+            "corr": m["r"],
+            "cRMSE": m["cRMSE"],
+        })
+
+df_t2 = pd.DataFrame(taylor_data_series)
+ref_std2 = df_t2["std_obs"].mean()
+
+# --- Top 10 global (true Borda) ---
+df_rank_concat = []
+for series, file in RANK_FILES.items():
+    dtmp = pd.read_csv(file).copy()
+    dtmp["series_type"] = series
+    df_rank_concat.append(dtmp)
+df_rank_concat = pd.concat(df_rank_concat, ignore_index=True)
+df_rank_concat = df_rank_concat.sort_values("borda_score", ascending=True)
+
+top10 = []
+for _, row in df_rank_concat.iterrows():
+    m = get_metrics_row(row["series_type"], row["model"], row["scenario"])
+    if m is None:
+        continue
+    top10.append({
+        "name": f"{row['series_type']} | {row['model']} | {row['scenario']}",
+        "std_obs": m["std_obs"],
+        "std_pred": m["std_pred"],
+        "corr": m["r"],
+        "cRMSE": m["cRMSE"],
+    })
+    if len(top10) == 10:
+        break
+
+df_t3 = pd.DataFrame(top10)
+ref_std3 = df_t3["std_obs"].mean()
+
+# --- Create multipanel figure ---
+fig = plt.figure(figsize=(14, 6))
+
+# (a) Top 3 per series
+ax1 = fig.add_subplot(1, 2, 1, projection='polar')
+dia1 = TaylorDiagram(ref_std2, fig=fig, rect=121, label="Reference")
+
+colors1 = plt.cm.tab10(np.linspace(0, 1, len(df_t2)))
+for (_, row), col in zip(df_t2.iterrows(), colors1):
+    dia1.add_sample(
+        row["std_pred"], row["corr"],
+        marker='o', ms=9, ls='',
+        mfc=col, mec=col,
+        label=row["name"]
+    )
+
+dia1.add_grid(alpha=0.3)
+contours1 = dia1.add_contours(levels=6, colors="0.5")
+plt.clabel(contours1, inline=1, fontsize=8)
+
+fig.legend(
+    dia1.samplePoints,
+    [p.get_label() for p in dia1.samplePoints],
+    loc="upper left",
+    bbox_to_anchor=(0.02, 0.95),
+    fontsize=8,
+    title="(a) Top 3 models per series",
+    frameon=True,
+)
+
+# (b) Top 10 global
+ax2 = fig.add_subplot(1, 2, 2, projection='polar')
+dia2 = TaylorDiagram(ref_std3, fig=fig, rect=122, label="Reference")
+
+colors2 = plt.cm.turbo(np.linspace(0, 1, len(df_t3)))
+for (_, row), col in zip(df_t3.iterrows(), colors2):
+    dia2.add_sample(
+        row["std_pred"], row["corr"],
+        marker='o', ms=9, ls='',
+        mfc=col, mec=col,
+        label=row["name"]
+    )
+
+dia2.add_grid(alpha=0.3)
+contours2 = dia2.add_contours(levels=6, colors="0.5")
+plt.clabel(contours2, inline=1, fontsize=8)
+
+fig.legend(
+    dia2.samplePoints,
+    [p.get_label() for p in dia2.samplePoints],
+    loc="upper right",
+    bbox_to_anchor=(0.98, 0.95),
+    fontsize=8,
+    title="(b) Top 10 global models",
+    frameon=True,
+)
+
+
+
+fig.suptitle("Taylor Diagrams (Top-ranked Models)", fontsize=14)
+plt.tight_layout(rect=[0, 0, 1, 0.92])
+
+plt.savefig(FIG_DIR / "Figure_03_taylor_diagrams.png", dpi=350)
+plt.close()
+#%%
+
+
+#%%
+# =============================================================================
+# 6. FIGURE 04 – SATELLITE vs REANALYSIS (TOP-50) – 2×2 PANELS
+# =============================================================================
+
+df_all = df_rank_all.copy()
+df_all["product"] = df_all["scenario"].apply(detect_product)
+df_all["corr_type"] = df_all["scenario"].apply(lambda s: "QM" if str(s).endswith("_QM") else "RAW")
+
+df_top50 = df_all.sort_values("borda_score").head(50).copy()
+df_top50["group"] = df_top50["product"].apply(detect_group_from_product)
+
+pct = df_top50["group"].value_counts(normalize=True) * 100
+pct_rean = pct.get("Reanalysis", 0)
+pct_sat = pct.get("Satellite", 0)
+
+fig, axes = plt.subplots(2, 2, figsize=(15, 11))
+ax1, ax2, ax3, ax4 = axes.ravel()
+
+# (a) RMSE by product
+sns.violinplot(
+    data=df_top50,
+    x="product",
+    y="RMSE",
+    palette=nature_colors_products,
+    ax=ax1
+)
+ax1.set_title("(a) RMSE distribution by product")
+ax1.set_xlabel("")
+ax1.grid(alpha=0.25)
+
+# (b) KGE by product
+sns.violinplot(
+    data=df_top50,
+    x="product",
+    y="KGE",
+    palette=nature_colors_products,
+    ax=ax2
+)
+ax2.set_title("(b) KGE distribution by product")
+ax2.set_xlabel("")
+ax2.grid(alpha=0.25)
+
+# (c) RMSE vs KGE scatter
+for _, row in df_top50.iterrows():
+    ax3.scatter(
+        row["RMSE"], row["KGE"],
+        s=(200 - row["borda_score"]) * 1.4,
+        color=nature_colors_products.get(row["product"], "gray"),
+        marker=corr_markers.get(row["corr_type"], "o"),
+        edgecolor="black",
+        linewidth=0.6,
+        alpha=0.85,
+    )
+
+ax3.set_xlabel("RMSE (lower is better)")
+ax3.set_ylabel("KGE (higher is better)")
+ax3.set_title("(c) RMSE vs KGE (TOP 50)")
+ax3.grid(alpha=0.25)
+
+# legend panel (c)
+prod_handles = [
+    plt.Line2D([0], [0], marker='o', color='w',
+               markerfacecolor=nature_colors_products[p],
+               markeredgecolor='black',
+               markersize=9, label=p)
+    for p in ["ERA5", "ERA5land", "CHIRPS", "PERSIANN_CDR", "INMET"]
+]
+corr_handles = [
+    plt.Line2D([0], [0], marker=corr_markers[k], color='black',
+               linestyle='', markersize=8, label=k)
+    for k in ["RAW", "QM"]
+]
+ax3.legend(
+    handles=prod_handles + corr_handles,
+    title="Products & Correction",
+    loc="upper right",
+    frameon=True,
+    facecolor="white",
+    edgecolor="black",
+)
+
+# (d) RAW vs QM RMSE + percentages
+sns.violinplot(
+    data=df_top50,
+    x="corr_type",
+    y="RMSE",
+    palette=["#999999", "#CCCCCC"],
+    ax=ax4
+)
+ax4.set_title("(d) RMSE RAW vs QM (TOP 50)")
+ax4.set_xlabel("Correction method")
+ax4.grid(alpha=0.25)
+
+ax4.text(
+    0.5, 0.95,
+    f"Reanalysis: {pct_rean:.1f}%",
+    transform=ax4.transAxes,
+    fontsize=11,
+    ha="center",
+    va="top",
+)
+ax4.text(
+    0.5, 0.88,
+    f"Satellite: {pct_sat:.1f}%",
+    transform=ax4.transAxes,
+    fontsize=11,
+    ha="center",
+    va="top",
+)
+
+fig.suptitle("Performance of Reanalysis vs Satellite Products (Top 50 Models)", fontsize=14)
+plt.tight_layout(rect=[0, 0, 1, 0.93])
+
+plt.savefig(FIG_DIR / "Figure_04_satellite_vs_reanalysis_top50.png", dpi=350)
+plt.close()
+
+#%%
+
+###
+# ============================================================
+# TOP-50 MODEL BEHAVIOUR ANALYSIS (Nature-style)
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+
+# ============================================================
+# 0. BASE DE DATOS (según tu estructura ya existente)
+# ============================================================
+
+# df_rank_all debe existir antes
+df_all = df_rank_all.copy()
+
+df_all["product"] = df_all["scenario"].apply(detect_product)
+df_all["corr_type"] = df_all["scenario"].apply(
+    lambda s: "QM" if str(s).endswith("_QM") else "RAW"
+)
+
+df_top50 = df_all.sort_values("borda_score").head(50).copy()
+df_top50["group"] = df_top50["product"].apply(detect_group_from_product)
+
+pct = df_top50["group"].value_counts(normalize=True) * 100
+pct_rean = pct.get("Reanalysis", 0)
+pct_sat = pct.get("Satellite", 0)
+
+# ============================================================
+# 1. DIRECTORIOS
+# ============================================================
+BASE = Path("outputs_rainfall_imputation")
+FIG_DIR = BASE / "Figures"
+FIG_DIR.mkdir(exist_ok=True)
+
+MODELS_DIR = FIG_DIR / "models_top50"
+MODELS_DIR.mkdir(exist_ok=True)
+
+# ============================================================
+# 2. CONFIGURACIÓN – NATURE STYLE
+# ============================================================
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 11,
+    "axes.titlesize": 13,
+    "axes.labelsize": 12,
+    "axes.linewidth": 0.9,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+})
+
+model_colors = {
+    "KNN": "#0072B2",
+    "SVR": "#009E73",
+    "RF":  "#D55E00",
+    "XGB": "#CC79A7",
+    "CAT": "#56B4E9",
+}
+
+models_core = ["KNN", "SVR", "RF", "XGB", "CAT"]
+
+# ============================================================
+# 3. FILTRO PARA ANALIZAR SOLO LOS MODELOS CENTRALES
+# ============================================================
+
+df_models = df_top50[df_top50["model"].isin(models_core)].copy()
+
+if df_models.empty:
+    print("\n⚠ No hay modelos KNN/SVR/RF/XGB/CAT en el Top-50.\n")
+
+else:
+
+    # ========================================================
+    # 4. TABLAS: FRECUENCIA + MÉTRICAS
+    # ========================================================
+
+    counts = df_models["model"].value_counts().reindex(models_core).fillna(0).astype(int)
+    pct_model = (counts / counts.sum() * 100).round(1)
+
+    freq_table = pd.DataFrame({"count_top50": counts, "pct_top50": pct_model})
+    freq_table.index.name = "model"
+    freq_table.to_csv(MODELS_DIR / "table_model_frequency_top50.csv")
+
+    metric_cols = ["RMSE", "KGE", "NSE", "r"]
+    metrics_summary = (
+        df_models.groupby("model")[metric_cols]
+        .agg(["mean", "std"])
+        .round(3)
+        .reindex(models_core)
+    )
+    metrics_summary.to_csv(MODELS_DIR / "table_metrics_top50.csv")
+
+    # ========================================================
+    # FIGURE M1 – FRECUENCIA EN EL TOP-50
+    # ========================================================
+
+    fig, ax = plt.subplots(figsize=(7,4))
+
+    ax.bar(
+        models_core,
+        counts.values,
+        color=[model_colors[m] for m in models_core],
+        edgecolor="black",
+        alpha=0.85
+    )
+
+    for i, (c, p) in enumerate(zip(counts.values, pct_model.values)):
+        ax.text(i, c + 0.25, f"{c} ({p:.1f}%)",
+                ha="center", va="bottom", fontsize=10)
+
+    ax.set_ylabel("Number of models")
+    ax.set_title("Frequency of models in the Top-50")
+    ax.grid(axis="y", alpha=0.25)
+
+    plt.tight_layout()
+    plt.savefig(MODELS_DIR / "Figure_M1_model_frequency.png", dpi=350)
+    plt.close()
+
+    # ========================================================
+    # FIGURE M2 – PANEL DE MÉTRICAS (RMSE, KGE, NSE, r)
+    # ========================================================
+
+    fig, axes = plt.subplots(2,2, figsize=(12,8))
+    ax_rmse, ax_kge, ax_nse, ax_r = axes.ravel()
+
+    # (a) RMSE
+    sns.boxplot(
+        data=df_models, x="model", y="RMSE",
+        palette=model_colors, ax=ax_rmse, showfliers=False
+    )
+    sns.stripplot(
+        data=df_models, x="model", y="RMSE",
+        ax=ax_rmse, color="black", size=3, alpha=0.55
+    )
+    ax_rmse.set_title("(a) RMSE by model")
+    ax_rmse.set_xlabel("")
+    ax_rmse.grid(alpha=0.25)
+
+    # (b) KGE
+    sns.boxplot(
+        data=df_models, x="model", y="KGE",
+        palette=model_colors, ax=ax_kge, showfliers=False
+    )
+    sns.stripplot(
+        data=df_models, x="model", y="KGE",
+        ax=ax_kge, color="black", size=3, alpha=0.55
+    )
+    ax_kge.set_title("(b) KGE by model")
+    ax_kge.set_xlabel("")
+    ax_kge.grid(alpha=0.25)
+
+    # (c) NSE
+    sns.boxplot(
+        data=df_models, x="model", y="NSE",
+        palette=model_colors, ax=ax_nse, showfliers=False
+    )
+    sns.stripplot(
+        data=df_models, x="model", y="NSE",
+        ax=ax_nse, color="black", size=3, alpha=0.55
+    )
+    ax_nse.set_title("(c) NSE by model")
+    ax_nse.set_xlabel("Model")
+    ax_nse.grid(alpha=0.25)
+
+    # (d) Pearson r
+    sns.boxplot(
+        data=df_models, x="model", y="r",
+        palette=model_colors, ax=ax_r, showfliers=False
+    )
+    sns.stripplot(
+        data=df_models, x="model", y="r",
+        ax=ax_r, color="black", size=3, alpha=0.55
+    )
+    ax_r.set_title("(d) Pearson r by model")
+    ax_r.set_xlabel("Model")
+    ax_r.grid(alpha=0.25)
+
+    fig.suptitle("Performance metrics by model (Top-50 Pareto–Borda)",
+                 fontsize=14)
+
+    plt.tight_layout(rect=[0,0,1,0.96])
+    plt.savefig(MODELS_DIR / "Figure_M2_metric_panels.png", dpi=350)
+    plt.close()
+
+    # ========================================================
+    # FIGURE M3 – SCATTER: RMSE vs KGE COLOREADO POR MODELO
+    # ========================================================
+
+    fig, ax = plt.subplots(figsize=(7,5))
+
+    for m in models_core:
+        sub = df_models[df_models["model"] == m]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["RMSE"], sub["KGE"],
+            s=50,
+            color=model_colors[m],
+            edgecolor="black",
+            alpha=0.85,
+            label=m
+        )
+
+    ax.invert_xaxis()                     # estilo hidrológico
+    ax.grid(alpha=0.25)
+    ax.set_xlabel("RMSE (lower is better)")
+    ax.set_ylabel("KGE (higher is better)")
+    ax.set_title("RMSE vs KGE by model (Top-50)")
+    ax.legend(title="Model", frameon=True, edgecolor="black")
+
+    plt.tight_layout()
+    plt.savefig(MODELS_DIR / "Figure_M3_scatter_RMSE_vs_KGE.png", dpi=350)
+    plt.close()
+
+    print("\n✔ Model Top-50 analysis saved in:", MODELS_DIR)
+
+#%%
+# ============================================================
+# Nature-style Violin Plots for RMSE, KGE, NSE, r (Top-50 Models)
+# ============================================================
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# ============================================
+# Añadir columna model_clean si no existe
+# ============================================
+
+if "model_clean" not in df_top50.columns:
+
+    def clean_model_name(m):
+        m = str(m).lower()
+        if "xgb" in m:
+            return "XGB"
+        if "cat" in m:
+            return "CAT"
+        if "rf" in m or "forest" in m:
+            return "RF"
+        if "svr" in m:
+            return "SVR"
+        if "knn" in m:
+            return "KNN"
+        return m.upper()
+
+    df_top50["model_clean"] = df_top50["model"].apply(clean_model_name)
+
+# ----------------------------------------------------------------------
+# STYLE (Nature-style)
+# ----------------------------------------------------------------------
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 11,
+    "axes.titlesize": 12,
+    "axes.labelsize": 11,
+    "axes.linewidth": 0.8,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+})
+
+palette_nature = ["#0072B2", "#009E73", "#D55E00"]  # XGB, CAT, RF
+panel_labels = ["(a)", "(b)", "(c)", "(d)"]
+metrics = ["RMSE", "KGE", "NSE", "r"]
+
+# ----------------------------------------------------------------------
+# FIGURE
+# ----------------------------------------------------------------------
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+axes = axes.ravel()
+
+for i, (ax, metric) in enumerate(zip(axes, metrics)):
+    sns.violinplot(
+        data=df_top50,
+        x="model_clean",
+        y=metric,
+        palette=palette_nature,
+        inner="point",
+        ax=ax
+    )
+
+    ax.set_title(f"{panel_labels[i]} {metric} by model")
+    ax.set_xlabel("")
+    ax.grid(alpha=0.25)
+
+# ----------------------------------------------------------------------
+# LAYOUT — the fix
+# ----------------------------------------------------------------------
+fig.tight_layout()            # esto organiza el grid principal
+fig.subplots_adjust(top=0.93) # espacio para el suptitle sin cortar nada
+
+fig.suptitle(
+    "Violin plots for RMSE, KGE, NSE and r – Top-50 Pareto–Borda Models",
+    fontsize=14
+)
+
+# ----------------------------------------------------------------------
+# SAVE — NO recorte, sin bordes extra
+# ----------------------------------------------------------------------
+plt.savefig(
+    FIG_DIR / "models_top50/Figure_M4_violin_models.png",
+    dpi=350,
+    bbox_inches="tight"       # elimina bordes sin cortar contenido
+)
+plt.close()
+
+print("✔ Figura guardada sin cortes.")
+
+
+# =============================================================================
+# 7. FIGURE 05 – FEATURE IMPORTANCE (BEST MODEL ONLY, TOP-15)
+# =============================================================================
+
+if not df_fi.empty:
+    # asumimos que feature_importance_all.csv contiene solo los 3 mejores modelos
+    # tomamos el que tenga menor borda_score (mejor)
+    df_best_join = df_fi.merge(df_rank_all,
+                               on=["scenario", "model"],
+                               how="left",
+                               suffixes=("", "_rank"))
+    df_best_join = df_best_join.sort_values("borda_score").copy()
+
+    best_model_row = df_best_join.iloc[0]
+    best_scen = best_model_row["scenario"]
+    best_model = best_model_row["model"]
+
+    df_best = df_fi[
+        (df_fi["scenario"] == best_scen) &
+        (df_fi["model"] == best_model)
+    ].copy()
+
+    if not df_best.empty:
+        # agrupar importancia por feature
+        df_best["feature"] = df_best["feature"].astype(str)
+        df_best["importance"] = df_best["importance"].astype(float)
+        df_best = df_best.groupby("feature", as_index=False)["importance"].mean()
+
+        # ordenar por importancia y tomar top 15
+        df_best = df_best.sort_values("importance", ascending=False).head(15)
+        df_best = df_best.sort_values("importance", ascending=True)
+
+        # clasificar tipo de feature
+        def classify_feature(f):
+            f = str(f)
+            if f.startswith("lag_"):
+                return "Lagged rain"
+            elif f.startswith("R_"):
+                return "Accumulation"
+            elif "DOY" in f:
+                return "Seasonality"
+            elif "WET" in f or "HY_phase" in f:
+                return "Hydrological index"
+            elif "ERA5" in f or "CHIRPS" in f or "PERSIANN" in f:
+                return "Exogenous"
+            else:
+                return "Other"
+
+        df_best["feature_type"] = df_best["feature"].apply(classify_feature)
+
+        type_palette = {
+            "Lagged rain":        "#0072B2",
+            "Accumulation":       "#009E73",
+            "Seasonality":        "#CC79A7",
+            "Hydrological index": "#D55E00",
+            "Exogenous":          "#999999",
+            "Other":              "#555555",
+        }
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # tamaños según importancia (más grande → más importante)
+        sizes = 80 + (df_best["importance"] / df_best["importance"].max()) * 220
+
+        y_pos = np.arange(len(df_best))
+        for i, row in enumerate(df_best.itertuples()):
+            ax.hlines(
+                y=y_pos[i],
+                xmin=0,
+                xmax=row.importance,
+                color=type_palette.get(row.feature_type, "#555555"),
+                linewidth=1.8,
+                alpha=0.9,
+            )
+            ax.scatter(
+                row.importance,
+                y_pos[i],
+                s=sizes.iloc[i],
+                color=type_palette.get(row.feature_type, "#555555"),
+                edgecolor="black",
+                linewidth=0.6,
+                zorder=3,
+            )
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(df_best["feature"])
+        ax.set_xlabel("Relative importance")
+        ax.set_title("Feature Importance (Top 15, Best-ranked Model)")
+
+        # leyenda tipos
+        handles_ft = [
+            mlines.Line2D([], [], marker='o', linestyle='',
+                          color=type_palette[t], label=t, markersize=8)
+            for t in df_best["feature_type"].unique()
+        ]
+        ax.legend(
+            handles=handles_ft,
+            title="Feature type",
+            loc="lower right",
+            frameon=True,
+            facecolor="white",
+            edgecolor="black",
+        )
+
+        ax.grid(axis="x", alpha=0.25)
+        plt.tight_layout()
+        plt.savefig(FIG_DIR / "Figure_05_feature_importance_best_model.png", dpi=350)
+        plt.close()
+
+#%%
+# =============================================================================
+# 8. FIGURE 06 – SCATTER PREDICTED vs OBSERVED (BEST M-ERA5 MODEL, Complete_IF)
+# =============================================================================
+
+file_scatter = BASE / "Complete_IF/predicted_vs_observed_M-ERA5_XGB_Grid.csv"
+rank_if = pd.read_csv(BASE / "Complete_IF/pareto_borda_ranking_Complete_IF.csv")
+
+if file_scatter.exists():
+    df_sc = pd.read_csv(file_scatter)
+    df_sc.columns = [c.lower() for c in df_sc.columns]
+
+    # parse date if exists
+    if "date" in df_sc.columns:
+        df_sc["date"] = pd.to_datetime(df_sc["date"])
+        df_sc.set_index("date", inplace=True)
+
+        # filtro 2018-01-01 a 2022-09-30
+        mask_period = (df_sc.index >= "2018-01-01") & (df_sc.index <= "2022-09-30")
+        df_sc = df_sc.loc[mask_period]
+
+    obs = df_sc["observed"].values
+    pred = df_sc["predicted"].values
+
+    # métricas del mejor ranking
+    best_row = rank_if.sort_values("borda_score").iloc[0]
+    r_val = best_row["r"]
+    rmse_val = best_row["RMSE"]
+    kge_val = best_row["KGE"]
+
+    # Scatter
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(
+        obs, pred,
+        s=18,
+        color="#0072B2",
+        edgecolor="black",
+        linewidth=0.3,
+        alpha=0.7,
+    )
+
+    # 1:1 line
+    min_val = min(obs.min(), pred.min())
+    max_val = max(obs.max(), pred.max())
+    ax.plot([min_val, max_val], [min_val, max_val],
+            color="black", linestyle="--", linewidth=1.0, label="1:1 line")
+
+    # tendencia sistemática
+    #coef = np.polyfit(obs, pred, 1)
+    #trend = np.poly1d(coef)
+    # --- Clean arrays ---
+    x = np.array(obs, dtype=float)
+    y = np.array(pred, dtype=float)
+    
+    mask = (
+        np.isfinite(x) &
+        np.isfinite(y)
+    )
+    x = x[mask]
+    y = y[mask]
+    
+    # Evitar problemas si la variancia es 0
+    if len(x) < 3 or np.std(x) == 0:
+        # Fallback seguro
+        slope = 1.0
+        intercept = 0.0
+    else:
+        try:
+            slope, intercept = np.polyfit(x, y, 1)
+        except Exception:
+            # Fallback cuando la SVD no converge
+            slope = np.nanmedian(y / x) if np.all(x != 0) else 1.0
+            intercept = 0.0
+    
+    # Función de tendencia
+    trend = lambda z: slope * np.asarray(z, dtype=float) + intercept
+
+##
+    ax.plot(
+        [min_val, max_val],
+        trend([min_val, max_val]),
+        color="#D55E00",
+        linestyle="-",
+        linewidth=1.0,
+        label="Linear fit",
+    )
+
+    ax.set_xlabel("Observed rainfall (mm/day)")
+    ax.set_ylabel("Predicted rainfall (mm/day)")
+    ax.set_title("Predicted vs Observed (Best M-ERA5 Model, Complete_IF)")
+
+    text_str = f"$r$ = {r_val:.2f}\nRMSE = {rmse_val:.2f}\nKGE = {kge_val:.2f}"
+    ax.text(
+        0.05, 0.95,
+        text_str,
+        transform=ax.transAxes,
+        ha="left", va="top",
+        fontsize=10,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.9, edgecolor="black"),
+    )
+
+    ax.legend(loc="lower right", frameon=True)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+
+    plt.savefig(FIG_DIR / "Figure_06_predicted_vs_observed_M_ERA5_best.png", dpi=350)
+    plt.close()
+
+#%%
+# ============================================================
+# IMPUTACIÓN FINAL DE RAIN_ORIGINAL USANDO M-ERA5_XGB_Grid
+# ============================================================
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import joblib
+
+# ------------------------------------------------------------
+# 1. RUTAS Y CONSTANTES
+# ------------------------------------------------------------
+
+# Archivos originales
+RAIN_PATH = Path(r"C:\Users\alejandra\Desktop\DATA_P\R_rain_outliers_cleaned.xlsx")
+EXOG_PATH = Path(r"C:\Users\alejandra\Desktop\DATA_P\dados_daily_v_exogenas.xlsx")
+
+# Carpeta de resultados del pipeline ML
+BASE = Path("outputs_rainfall_imputation")
+
+# Modelo entrenado (mejor escenario M-ERA5)
+MODEL_PATH = BASE / "Complete_IF/best_model_M-ERA5_XGB_Grid.pkl"
+
+# Carpeta para guardar imputación final
+OUT_DIR = BASE / "Figures/R_imputation_final"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Parámetros de features (coherentes con el entrenamiento)
+LAGS_TARGET = 14               # número de rezagos de la precipitación
+ACC_WINDOWS = [3, 7, 14]       # ventanas de acumulación
+EXO_LAGS = [0, 1, 2]           # rezagos de exógenas
+WET_MONTHS = [10, 11, 12, 1, 2, 3]  # meses de estación húmeda
+END_IMPUTE = pd.to_datetime("2023-09-30")
+
+
+# ------------------------------------------------------------
+# 2. FUNCIONES AUXILIARES
+# ------------------------------------------------------------
+
+def find_date_col(df: pd.DataFrame) -> str:
+    """
+    Detecta la columna de fechas en el DataFrame
+    (asume nombres tipo 'Date'/'date'/'fecha').
+    """
+    for c in df.columns:
+        if c.lower() in ("date", "Datetime", "datetime"):
+            return c
+    raise ValueError("No se encontró columna de fecha en el DataFrame.")
+
+
+def build_daily_features(
+    y: pd.Series,
+    lags: int = LAGS_TARGET,
+    acc_windows: list = ACC_WINDOWS
+) -> pd.DataFrame:
+    """
+    Construye las features endógenas para la serie de precipitación:
+    - Lags de lluvia (1...lags)
+    - Acumulados (3, 7, 14 días; desplazados 1 día para evitar leakage)
+    - Armónicos DOY_sin / DOY_cos
+    - Indicador de estación húmeda
+    - Índice de fase hidrológica (0–1)
+    - Columna 'target' al final
+    """
+    df = pd.DataFrame(index=y.index)
+
+    # Lags de la propia serie
+    for k in range(1, lags + 1):
+        df[f"lag_{k}"] = y.shift(k)
+
+    # Acumulados de precipitación
+    for w in acc_windows:
+        df[f"R_{w}d"] = y.rolling(w).sum().shift(1)
+
+    # Estacionalidad (día del año)
+    doy = df.index.dayofyear
+    df["DOY_sin"] = np.sin(2.0 * np.pi * doy / 365.0)
+    df["DOY_cos"] = np.cos(2.0 * np.pi * doy / 365.0)
+
+    # Bandera de estación húmeda
+    df["WET_flag"] = df.index.month.isin(WET_MONTHS).astype(int)
+
+    # Fase hidrológica (año hidrológico que empieza en octubre)
+    hydroy = np.where(df.index.month >= 10, df.index.year, df.index.year - 1)
+    hyd_start = pd.to_datetime([f"{hy}-10-01" for hy in hydroy])
+    delta_days = (df.index - hyd_start).days
+    df["HY_phase"] = delta_days / 365.0
+
+    # Target
+    df["target"] = y
+
+    return df
+
+
+def build_exog_era5(
+    era5_series: pd.Series,
+    full_index: pd.DatetimeIndex,
+    exo_lags: list = EXO_LAGS
+) -> pd.DataFrame:
+    """
+    Construye las features exógenas para ERA5:
+    ERA5_lag0, ERA5_lag1, ERA5_lag2 en el índice completo.
+    """
+    era5_series = era5_series.reindex(full_index)
+    df_exog = pd.DataFrame(index=full_index)
+
+    for lag in exo_lags:
+        df_exog[f"ERA5_lag{lag}"] = era5_series.shift(lag)
+
+    return df_exog
+
+
+def impute_rain_original_with_best_model():
+    # --------------------------------------------------------
+    # 3. CARGA DE DATOS
+    # --------------------------------------------------------
+
+    # --- Precipitación observada (rain_original) ---
+    rain_df = pd.read_excel(RAIN_PATH)
+    date_col_rain = find_date_col(rain_df)
+    rain_df[date_col_rain] = pd.to_datetime(rain_df[date_col_rain])
+    rain_df.set_index(date_col_rain, inplace=True)
+    rain_df = rain_df.sort_index()
+
+    if "rain_original" not in rain_df.columns:
+        raise ValueError("No se encontró la columna 'rain_original' en RAIN_PATH.")
+
+    y_obs = rain_df["rain_original"].astype(float)
+
+    # --- Exógenas (ERA5) ---
+    exog_df = pd.read_excel(EXOG_PATH)
+    date_col_exog = find_date_col(exog_df)
+    exog_df[date_col_exog] = pd.to_datetime(exog_df[date_col_exog])
+    exog_df.set_index(date_col_exog, inplace=True)
+    exog_df = exog_df.sort_index()
+
+    if "ERA5" not in exog_df.columns:
+        raise ValueError("No se encontró la columna 'ERA5' en EXOG_PATH.")
+
+    era5 = exog_df["ERA5"].astype(float)
+
+    # --------------------------------------------------------
+    # 4. DEFINIR ÍNDICE COMPLETO (desde primer dato hasta 30/09/2023)
+    # --------------------------------------------------------
+
+    start_date = y_obs.index.min()
+    full_index = pd.date_range(start=start_date, end=END_IMPUTE, freq="D")
+
+    # Reindexar la serie de lluvia al índice completo
+    y_full = y_obs.reindex(full_index)
+
+    # Reindexar ERA5 al mismo índice
+    era5_full = era5.reindex(full_index)
+
+    # --------------------------------------------------------
+    # 5. CONSTRUCCIÓN DE FEATURES
+    # --------------------------------------------------------
+
+    # Endógenas
+    endog_df = build_daily_features(y_full)
+
+    # Exógenas ERA5
+    exog_era5_df = build_exog_era5(era5_full, full_index)
+
+    # Escenario multivariado M-ERA5:
+    # concatenamos endógenas + ERA5_lag*
+    scen_M_ERA5 = pd.concat([endog_df, exog_era5_df], axis=1)
+
+    # X con solo features; y como columna target (para referencia)
+    X_all = scen_M_ERA5.drop(columns=["target"])
+    y_target = scen_M_ERA5["target"]
+
+    # --------------------------------------------------------
+    # 6. CARGA DEL MODELO ENTRENADO
+    # --------------------------------------------------------
+
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(f"No se encontró el modelo: {MODEL_PATH}")
+
+    model = joblib.load(MODEL_PATH)
+
+    # --------------------------------------------------------
+    # 7. IMPUTACIÓN DE HUECOS
+    # --------------------------------------------------------
+
+    # Huecos originales en rain_original
+    mask_nan = y_full.isna()
+
+    # X para las fechas con NA en el objetivo
+    X_pred = X_all.loc[mask_nan]
+
+    # Predicción (el pipeline debe incluir el SimpleImputer)
+    y_pred = model.predict(X_pred)
+
+    # Serie imputada: copia de la completa, rellenando solo en huecos
+    y_imputed = y_full.copy()
+    y_imputed.loc[mask_nan] = y_pred
+
+    # Por claridad, construimos también la serie "final" que respeta los datos originales
+    # (equivalente a y_imputed, pero explícito):
+    rain_final = y_full.copy()
+    rain_final.loc[mask_nan] = y_pred
+
+    # --------------------------------------------------------
+    # 8. GUARDAR RESULTADO FINAL
+    # --------------------------------------------------------
+
+    out_df = pd.DataFrame({
+        "date": full_index,
+        "rain_original": y_full.values,
+        "rain_imputed": y_imputed.values,
+        "rain_final": rain_final.values
+    }).set_index("date")
+
+    out_file = OUT_DIR / "imputed_complete_IF_M-ERA5_XGB_Grid.csv"
+    out_df.to_csv(out_file, float_format="%.3f")
+
+    print("\n==============================================")
+    print("✔ Imputación final completada:")
+    print(f"   Archivo guardado en: {out_file}")
+    print(f"   Fechas: {full_index.min().date()} → {full_index.max().date()}")
+    print(f"   Nº de valores imputados: {mask_nan.sum()}")
+    print("==============================================\n")
+
+# ------------------------------------------------------------
+# 9. LLAMADA (DESCOMENTAR SI QUIERES EJECUTAR DIRECTO)
+# ------------------------------------------------------------
+
+if __name__ == "__main__":
+    impute_rain_original_with_best_model()
+
+#%%
+# ======================================================================
+# ANALYSIS: ORIGINAL vs IMPUTED SERIES (Nature-style Figures)
+# ======================================================================
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+from statsmodels.tsa.seasonal import STL
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# Funciones hidrológicas
+def nse(sim, obs):
+    return 1 - np.sum((sim - obs)**2) / np.sum((obs - np.mean(obs))**2)
+
+def kge(sim, obs):
+    r = np.corrcoef(sim, obs)[0,1]
+    alpha = np.std(sim) / np.std(obs)
+    beta = np.mean(sim) / np.mean(obs)
+    return 1 - np.sqrt((r-1)**2 + (alpha-1)**2 + (beta-1)**2)
+
+# -------------------------------------------------------------
+# 1. PATHS
+# -------------------------------------------------------------
+BASE = Path("outputs_rainfall_imputation")
+FILE = BASE / "Figures/R_imputation_final/imputed_Complete_IF_M-ERA5_XGB_Grid.csv"
+#FILE = BASE / "Figures/R_imputation_final/imputed_rain_original_M-ERA5_XGB_Grid_REFINED_missforest.csv"
+#FILE = refined_path
+
+
+OUT = BASE / "Figures/R_imputation_final"
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+from statsmodels.tsa.seasonal import STL
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+# ------------------------------------------------------------
+# GLOBAL STYLE (Nature-like)
+# ------------------------------------------------------------
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 11,
+    "axes.titlesize": 13,
+    "axes.labelsize": 12,
+    "axes.linewidth": 0.8,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+})
+
+COLOR_ORIG = "#0072B2"    # azul
+COLOR_IMP  = "#D55E00"    # naranja
+COLOR_SEAS = "#009E73"    # verde
+COLOR_RES  = "#555555"    # gris
+
+# ------------------------------------------------------------
+# 1. LOAD DATA
+# ------------------------------------------------------------
+df = pd.read_csv(FILE, parse_dates=["date"]).set_index("date")
+
+# Recorte
+df = df.loc["2013-09-14":"2023-09-30"]
+
+rain_orig = df["rain_original"]
+rain_imp  = df["rain_imputed"]
+# Cargar la serie refinada (MissForest)
+
+
+
+
+# ------------------------------------------------------------
+# 2. MÉTRICAS DE COMPARACIÓN
+# ------------------------------------------------------------
+mask = ~rain_orig.isna()
+obs = rain_orig[mask]
+sim = rain_imp[mask]
+
+rmse = np.sqrt(mean_squared_error(obs, sim))
+mae  = mean_absolute_error(obs, sim)
+r    = np.corrcoef(obs, sim)[0,1]
+
+def nse(sim, obs):
+    return 1 - np.sum((sim - obs)**2) / np.sum((obs - np.mean(obs))**2)
+
+def kge(sim, obs):
+    r_corr = np.corrcoef(sim, obs)[0,1]
+    alpha = np.std(sim) / np.std(obs)
+    beta  = np.mean(sim) / np.mean(obs)
+    return 1 - np.sqrt((r_corr-1)**2 + (alpha-1)**2 + (beta-1)**2)
+
+nse_v = nse(sim, obs)
+kge_v = kge(sim, obs)
+
+metrics_table = pd.DataFrame({
+    "RMSE": [rmse],
+    "MAE":  [mae],
+    "R":    [r],
+    "NSE":  [nse_v],
+    "KGE":  [kge_v]
+})
+metrics_table.to_csv(OUT / "Table_metrics_original_vs_imputed.csv", index=False)
+
+
+# ======================================================================
+# FIGURE 01 – Histogram comparison (Nature style)
+# ======================================================================
+fig, ax = plt.subplots(figsize=(12,5))
+
+ax.hist(rain_orig.dropna(), bins=40, alpha=0.70,
+        color=COLOR_ORIG, edgecolor="black", linewidth=0.3,
+        label="Original")
+
+ax.hist(rain_imp, bins=40, alpha=0.55,
+        color=COLOR_IMP, edgecolor="black", linewidth=0.3,
+        label="Imputed")
+
+ax.set_title("Distribution of rainfall: Original vs Imputed")
+ax.set_xlabel("Rainfall (mm/day)")
+ax.set_ylabel("Frequency")
+ax.legend(frameon=True)
+ax.grid(alpha=0.25)
+
+plt.tight_layout()
+plt.savefig(OUT / "Figure_01_histogram_original_vs_imputed.png", dpi=350)
+plt.close()
+
+
+# ======================================================================
+# FIGURE 02 – Event statistics (>5 mm & >P90)
+# ======================================================================
+umbral = 5.0
+p90 = rain_orig.dropna().quantile(0.90)
+
+events_df = pd.DataFrame({
+    "Wet days >5 mm": [
+        (rain_orig > umbral).sum(),
+        (rain_imp > umbral).sum()
+    ],
+    "Events >90th percentile": [
+        (rain_orig > p90).sum(),
+        (rain_imp > p90).sum()
+    ],
+}, index=["Original", "Imputed"])
+
+events_df.to_csv(OUT / "Table_event_statistics.csv")
+
+fig, axes = plt.subplots(1, 2, figsize=(12,4), sharey=True)
+
+# (a)
+axes[0].bar(events_df.index,
+            events_df["Wet days >5 mm"],
+            color=[COLOR_ORIG, COLOR_IMP],
+            edgecolor="black")
+axes[0].set_title("(a) Wet days > 5 mm")
+axes[0].set_ylabel("Count")
+axes[0].grid(axis="y", alpha=0.25)
+
+# (b)
+axes[1].bar(events_df.index,
+            events_df["Events >90th percentile"],
+            color=[COLOR_ORIG, COLOR_IMP],
+            edgecolor="black")
+axes[1].set_title("(b) Extreme events > 90th percentile")
+axes[1].grid(axis="y", alpha=0.25)
+
+fig.suptitle("Event statistics: Original vs Imputed", fontsize=14)
+plt.tight_layout(rect=[0,0,1,0.92])
+plt.savefig(OUT / "Figure_02_event_statistics.png", dpi=350)
+plt.close()
+
+
+# ======================================================================
+# FIGURE 03 – Time series (bars) + shaded imputed sections
+# ======================================================================
+missing_mask = rain_orig.isna()
+
+# encontrar bloques imputados
+blocks = []
+in_block = False
+for i in range(len(missing_mask)):
+    if missing_mask[i] and not in_block:
+        start = missing_mask.index[i]
+        in_block = True
+    if not missing_mask[i] and in_block:
+        end = missing_mask.index[i-1]
+        blocks.append((start, end))
+        in_block=False
+if in_block:
+    blocks.append((start, missing_mask.index[-1]))
+
+fig, ax = plt.subplots(figsize=(16,6))
+
+# original
+ax.bar(df.index, rain_orig, width=1.0,
+       color=COLOR_ORIG, alpha=0.70,
+       edgecolor="black", linewidth=0.25,
+       label="Original")
+
+# imputed
+ax.bar(df.index, rain_imp, width=1.0,
+       color=COLOR_IMP, alpha=0.40,
+       edgecolor="black", linewidth=0.25,
+       label="Imputed")
+
+# sombreado
+for s, e in blocks:
+    ax.axvspan(s, e, color="grey", alpha=0.18)
+
+ax.set_title("Rainfall: Original vs Imputed (shaded = imputed period)")
+ax.set_ylabel("Rainfall (mm/day)")
+ax.grid(alpha=0.25)
+ax.legend(frameon=True)
+
+plt.tight_layout()
+plt.savefig(OUT / "Figure_03_time_series_shaded.png", dpi=350)
+plt.close()
+
+#%%
+# ======================================================================
+# FIGURE 04 – STL decomposition (both series) + shading
+# ======================================================================
+
+# --- reconstruimos STL para el periodo recortado ---
+#series_orig_fill = rain_orig.copy()
+#series_orig_fill[series_orig_fill.isna()] = rain_imp[series_orig_fill.isna()]
+
+# --- recortamos la serie antes de hacer cualquier gráfico ---
+df = df.loc["2013-09-14":"2023-09-30"]
+rain_orig = df["rain_original"]
+rain_imp  = df["rain_imputed"]
+
+# -----------------------------------------------------------------
+# STL: original con huecos (interpolada SOLO para el cálculo)
+#      imputada completa
+# -----------------------------------------------------------------
+
+# serie original para STL: interpolación temporal para tener continuidad
+series_orig_stl = rain_orig.copy()
+series_orig_stl = series_orig_stl.interpolate(method="time", limit_direction="both")
+
+# serie imputada para STL (ya es continua)
+series_imp_stl = rain_imp.copy()
+
+from statsmodels.tsa.seasonal import STL
+
+stl_orig = STL(series_orig_stl, period=365, robust=True).fit()
+stl_imp  = STL(series_imp_stl,  period=365, robust=True).fit()
+
+# componentes a graficar
+# fila 1: observed → usamos la serie REAL:
+components_orig = [
+    rain_orig,            # Observed con huecos
+    stl_orig.trend,
+    stl_orig.seasonal,
+    stl_orig.resid
+]
+
+components_imp = [
+    rain_imp,             # Observed imputada completa
+    stl_imp.trend,
+    stl_imp.seasonal,
+    stl_imp.resid
+]
+
+titles_left  = ["Original – Observed", "Original – Trend",
+                "Original – Seasonal", "Original – Remainder"]
+
+titles_right = ["Imputed – Observed", "Imputed – Trend",
+                "Imputed – Seasonal", "Imputed – Remainder"]
+
+fig, axes = plt.subplots(4, 2, figsize=(14, 10), sharex=True)
+
+for i in range(4):
+
+    # --- PLOT LEFT (original) ---
+    axes[i,0].plot(df.index, components_orig[i], 
+                   color=COLOR_ORIG, linewidth=0.9)
+    axes[i,0].set_title(f"(a) {titles_left[i]}")
+    axes[i,0].grid(alpha=0.25)
+
+    # --- PLOT RIGHT (imputed) ---
+    axes[i,1].plot(df.index, components_imp[i],
+                   color=COLOR_IMP, linewidth=0.9)
+    axes[i,1].set_title(f"(b) {titles_right[i]}")
+    axes[i,1].grid(alpha=0.25)
+
+    # --- SAME Y-SCALE FOR BOTH PANELS IN THIS ROW ---
+    y_min = min(components_orig[i].min(), components_imp[i].min())
+    y_max = max(components_orig[i].max(), components_imp[i].max())
+    y_pad = 0.05 * (y_max - y_min)
+
+    axes[i,0].set_ylim(y_min - y_pad, y_max + y_pad)
+    axes[i,1].set_ylim(y_min - y_pad, y_max + y_pad)
+
+    # --- SHADED IMPUTATION ZONES ---
+    for s, e in blocks:
+        axes[i,0].axvspan(s, e, color="grey", alpha=0.15)
+        axes[i,1].axvspan(s, e, color="grey", alpha=0.15)
+
+# X labels en la última fila
+for ax in axes[-1,:]:
+    ax.set_xlabel("Date")
+
+fig.suptitle("STL decomposition: Original vs Imputed (shaded = imputed period)",
+             fontsize=14)
+
+plt.tight_layout(rect=[0, 0, 1, 0.93])
+plt.savefig(OUT / "Figure_04_STL_comparison_shaded.png", dpi=350)
+plt.close()
+
+#%%
+##
+
+# ============================================================
+# 📌 ADVANCED STL DIAGNOSTICS – ORIGINAL vs IMPUTED
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from scipy.signal import periodogram
+import matplotlib.pyplot as plt
+
+# Output folder
+OUT_DIAG = OUT / "STL_diagnostics"
+OUT_DIAG.mkdir(exist_ok=True)
+
+COLOR_ORIG = "#0072B2"
+COLOR_IMP = "#D55E00"
+
+# ------------------------------------------------------------
+# 1) EXTRAER COMPONENTES DEL MISMO LONGITUD EXACTA
+# ------------------------------------------------------------
+idx = df.index
+
+orig_obs = stl_orig.observed.loc[idx]
+orig_trd = stl_orig.trend.loc[idx]
+orig_sea = stl_orig.seasonal.loc[idx]
+orig_res = stl_orig.resid.loc[idx]
+
+imp_obs  = stl_imp.observed.loc[idx]
+imp_trd  = stl_imp.trend.loc[idx]
+imp_sea  = stl_imp.seasonal.loc[idx]
+imp_res  = stl_imp.resid.loc[idx]
+
+# ------------------------------------------------------------
+# 2) ESTADÍSTICAS BÁSICAS DE CADA COMPONENTE
+# ------------------------------------------------------------
+
+summary = pd.DataFrame({
+    "orig_std":   [orig_trd.std(), orig_sea.std(), orig_res.std()],
+    "imp_std":    [imp_trd.std(), imp_sea.std(), imp_res.std()],
+    "abs_diff":   [
+        np.mean(np.abs(orig_trd - imp_trd)),
+        np.mean(np.abs(orig_sea - imp_sea)),
+        np.mean(np.abs(orig_res - imp_res))
+    ]
+}, index=["Trend", "Seasonal", "Residual"])
+
+summary.to_csv(OUT_DIAG / "STL_component_stats.csv")
+
+# ------------------------------------------------------------
+# 3) CORRELACIONES ENTRE COMPONENTES
+# ------------------------------------------------------------
+
+corrs = pd.DataFrame({
+    "corr": [
+        np.corrcoef(orig_trd, imp_trd)[0,1],
+        np.corrcoef(orig_sea, imp_sea)[0,1],
+        np.corrcoef(orig_res, imp_res)[0,1]
+    ]
+}, index=["Trend", "Seasonal", "Residual"])
+
+corrs.to_csv(OUT_DIAG / "STL_component_correlations.csv")
+
+# ------------------------------------------------------------
+# 4) MSE ENTRE COMPONENTES
+# ------------------------------------------------------------
+mse_trend = np.mean((orig_trd - imp_trd)**2)
+mse_season = np.mean((orig_sea - imp_sea)**2)
+mse_resid = np.mean((orig_res - imp_res)**2)
+
+mse_table = pd.DataFrame({
+    "MSE":[mse_trend, mse_season, mse_resid]
+}, index=["Trend","Seasonal","Residual"])
+
+mse_table.to_csv(OUT_DIAG / "STL_MSE_components.csv")
+
+# ------------------------------------------------------------
+# 5) AMPLITUD ESTACIONAL
+# ------------------------------------------------------------
+amp_orig = orig_sea.max() - orig_sea.min()
+amp_imp  = imp_sea.max() - imp_sea.min()
+
+pd.DataFrame({
+    "amplitude":[amp_orig, amp_imp]
+}, index=["Original","Imputed"]).to_csv(OUT_DIAG / "STL_seasonal_amplitude.csv")
+
+# ------------------------------------------------------------
+# 6) SUAVIDAD DE LA TENDENCIA
+# ------------------------------------------------------------
+smooth_orig = np.mean(np.abs(np.diff(orig_trd)))
+smooth_imp  = np.mean(np.abs(np.diff(imp_trd)))
+
+pd.DataFrame({
+    "smoothness":[smooth_orig, smooth_imp]
+}, index=["Original","Imputed"]).to_csv(OUT_DIAG / "STL_trend_smoothness.csv")
+
+# ------------------------------------------------------------
+# 7) EVENTOS EXTREMOS EN EL RESIDUAL
+# ------------------------------------------------------------
+thr_o = 2 * orig_res.std()
+thr_i = 2 * imp_res.std()
+
+ext_orig = (np.abs(orig_res) > thr_o).sum()
+ext_imp  = (np.abs(imp_res) > thr_i).sum()
+
+pd.DataFrame({
+    "extreme_residuals":[ext_orig, ext_imp]
+}, index=["Original","Imputed"]).to_csv(OUT_DIAG / "STL_extreme_residuals.csv")
+
+# ------------------------------------------------------------
+# 8) PERIODOGRAMA (ruido espectral comparativo)
+# ------------------------------------------------------------
+f_o, p_o = periodogram(orig_res)
+f_i, p_i = periodogram(imp_res)
+
+plt.figure(figsize=(10,4))
+plt.plot(f_o, p_o, color=COLOR_ORIG, label="Original Residual", alpha=0.7)
+plt.plot(f_i, p_i, color=COLOR_IMP, label="Imputed Residual", alpha=0.7)
+plt.xlim(0, 0.015)
+plt.title("Spectral density of residuals (STL)")
+plt.xlabel("Frequency")
+plt.ylabel("Power")
+plt.legend()
+plt.grid(alpha=0.25)
+plt.tight_layout()
+plt.savefig(OUT_DIAG / "Figure_STL_residual_spectrum.png", dpi=350)
+plt.close()
+
+# ------------------------------------------------------------
+# 9) FINAL TABLE
+# ------------------------------------------------------------
+
+final_table = pd.concat([
+    summary.rename(columns={"orig_std":"orig_std","imp_std":"imp_std","abs_diff":"abs_diff"}),
+    corrs.rename(columns={"corr":"corr"}),
+    mse_table.rename(columns={"MSE":"MSE"})
+], axis=1)
+
+final_table.to_csv(OUT_DIAG / "STL_full_comparison_table.csv")
+
+print("\n===============================================")
+print("✔ STL COMPLEX DIAGNOSTICS GENERATED")
+print(f"📂 Folder: {OUT_DIAG}")
+print("Files produced:")
+print(" - STL_component_stats.csv")
+print(" - STL_component_correlations.csv")
+print(" - STL_MSE_components.csv")
+print(" - STL_seasonal_amplitude.csv")
+print(" - STL_trend_smoothness.csv")
+print(" - STL_extreme_residuals.csv")
+print(" - Spectral density figure")
+print(" - Full comparison table")
+print("===============================================\n")
+
+
+#%%
+# SHAP Y XAI
+##################################################################
+###############################################################################
+# SHAP + XAI GENERATOR — FINAL VERSION (WORKING)
+###############################################################################
+import joblib
+import pandas as pd
+import numpy as np
+import shap
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ================================
+# 1. Model configuration
+# ================================
+TARGET = "rain_original"         
+SCEN   = "M-ERA5land"
+MODEL  = "RF"
+OPT    = "Grid"
+
+ROOT = Path("outputs_rainfall_imputation")
+target_dir = ROOT / TARGET
+
+model_path = target_dir / f"best_model_{SCEN}_{MODEL}_{OPT}.pkl"
+fi_path    = target_dir / f"feature_importance_{SCEN}_{MODEL}_{OPT}.csv"
+
+# archivos base
+all_series_path = ROOT / "all_series_raw_qm.csv"
+exog_path       = Path(r"C:\Users\alejandra\Desktop\DATA_P\dados_daily_v_exogenas.xlsx")
+
+# ================================
+# 2. models and feature
+# ================================
+pipe = joblib.load(model_path)
+
+fi = pd.read_csv(fi_path)
+feature_cols = fi["feature"].tolist()
+
+# ================================
+# 3. BASE Data
+# ================================
+df_main = pd.read_csv(all_series_path, index_col=-1)
+df_main.index = pd.to_datetime(df_main.index, errors="coerce")
+df_main = df_main[~df_main.index.isna()]
+df_main.index.name = "date"
+
+df_exog = pd.read_excel(exog_path, index_col=0)
+df_exog.index = pd.to_datetime(df_exog.index, errors="coerce")
+df_exog = df_exog[~df_exog.index.isna()]
+df_exog.index.name = "date"
+
+# UNIR EXÓGENOS
+df_all = df_main.join(df_exog, how="left")
+
+
+# ================================
+# 4. feature reconstruction
+# ================================
+# --- ENDOGENOUS (lluvia)
+y = df_all[TARGET]
+
+df_endog = build_daily_features(y)
+
+
+# --- EXOGENOUS ------------------
+exo_products = [
+    c for c in df_exog.columns 
+    if "_QM" not in c     # QM se arma aparte
+]
+
+# QM dict
+qm_dict = {
+    f"{c}_QM": df_exog[c] 
+    for c in df_exog.columns
+}
+
+raw_exo, qm_exo = build_exogenous_features(
+    exog_df=df_exog,
+    exog_products=exo_products,
+    qm_dict=qm_dict,
+    full_index=df_all.index
+)
+
+# UNIR TODO
+X_full = pd.concat([df_endog, raw_exo, qm_exo], axis=1)
+
+# Eliminar target
+if "target" in X_full.columns:
+    X_full = X_full.drop(columns=["target"])
+
+# ORDENAR SEGÚN FEATURES DEL MODELO
+X_full = X_full[feature_cols]
+
+# IMPUTAR NaNs IGUAL QUE EL PIPE
+X_full = X_full.fillna(X_full.mean())
+
+
+# ================================
+# 5. SHAP
+# ================================
+model_internal = pipe.named_steps["model"]
+
+masker = shap.maskers.Independent(X_full, max_samples=300)
+explainer = shap.Explainer(model_internal, masker)
+
+# sample para velocidad
+sample = X_full.sample(min(500, len(X_full)), random_state=0)
+shap_values = explainer(sample)
+
+# ================================
+# 6. Save
+# ================================
+out_dir = target_dir / "XAI_SHAP"
+out_dir.mkdir(exist_ok=True)
+
+# CSV
+pd.DataFrame(shap_values.values, columns=sample.columns).to_csv(
+    out_dir / f"shap_values_{SCEN}_{MODEL}_{OPT}.csv",
+    index=False
+)
+
+# PLOTS
+shap.summary_plot(shap_values.values, sample, show=False)
+plt.savefig(out_dir / f"shap_summary_{SCEN}_{MODEL}_{OPT}.png", dpi=300)
+plt.close()
+
+shap.plots.beeswarm(shap_values, show=False)
+plt.savefig(out_dir / f"shap_beeswarm_{SCEN}_{MODEL}_{OPT}.png", dpi=300)
+plt.close()
+
+shap.plots.bar(shap_values, show=False)
+plt.savefig(out_dir / f"shap_barplot_{SCEN}_{MODEL}_{OPT}.png", dpi=300)
+plt.close()
+
+print("✔ SHAP + XAI generados correctamente para:", SCEN, MODEL, OPT)
