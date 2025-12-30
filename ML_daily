@@ -146,8 +146,8 @@ except Exception:
 # according to your local machine.  The files must be Excel
 # workbooks where the first column contains dates and subsequent
 # columns contain the target series or exogenous predictors.
-RAIN_PATH: str = r"C:\Users\alejandra\Desktop\DATA_P\R_rain_outliers_cleaned.xlsx"
-EXOG_PATH: str = r"C:\Users\alejandra\Desktop\DATA_P\dados_daily_v_exogenas.xlsx"
+RAIN_PATH = "data/rainfall_daily.xlsx"
+EXOG_PATH = "data/exogenous_predictors.xlsx"
 
 # Training window for model fitting.  Only data within this period
 # (inclusive) are used to train the models.  This window should
