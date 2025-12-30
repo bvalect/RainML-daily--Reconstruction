@@ -1,0 +1,517 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from prophet import Prophet
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# as always, set some useful parameters
+plt.rcParams['figure.figsize'] = (10, 7.5)
+plt.rcParams['axes.grid'] = False
+
+"""The Data set"""
+
+df_raw = pd.read_excel(r"data/dados_Torre2012_2024hourlyV5.xlsx")
+
+df_raw.head()
+
+RAIN_COL = "Rain_(mm)"
+
+OUT_DIR   = r"data/2_3_Hourly_LSTM/graphics"
+
+"""1. Utilities"""
+
+# Detecta la primera columna como datetime
+first_col = df_raw.columns[0]
+#df_raw[first_col] = pd.to_datetime(df_raw[first_col], errors='coerce', infer_datetime_format=True)
+df_raw[first_col] = pd.to_datetime(df_raw[first_col], errors='coerce')
+# Ordena por fecha (por si acaso) y elimina duplicados/nulos de fecha
+df_raw = df_raw.sort_values(first_col).dropna(subset=[first_col])
+
+# select data and rain, name as ds/y
+df = df_raw[[first_col, RAIN_COL]].rename(columns={first_col: "ds", RAIN_COL: "y"}).copy()
+
+# hourly frequency
+# df = df.set_index("ds").asfreq("H").reset_index()
+
+# cut data
+START_DATE = "2018-01-01 00:00:00"
+END_DATE   = "2022-09-30 23:00:00"
+
+mask = (df["ds"] >= pd.to_datetime(START_DATE)) & (df["ds"] <= pd.to_datetime(END_DATE))
+df_cut = df.loc[mask].copy()
+
+# No NaN 
+df_cut = df_cut.dropna(subset=["y"])
+
+print(df_cut.head())
+print(df_cut.tail())
+print(df_cut["ds"].min(), "→", df_cut["ds"].max(), " | n =", len(df_cut))
+
+df = df_cut.copy()
+
+# split off the last year for testing using date-based slicing
+end_date = df['ds'].max()
+start_test_date = end_date - pd.Timedelta(days=365)
+
+train = df[df['ds'] < start_test_date].copy()
+test = df[df['ds'] >= start_test_date].copy()
+
+print(f"Train data from {train['ds'].min()} to {train['ds'].max()} ({len(train)} hours)")
+print(f"Test data from {test['ds'].min()} to {test['ds'].max()} ({len(test)} hours)")
+
+m = Prophet()
+
+m.fit(train);
+
+# Generate a future dataframe for forecasting
+# periods = number of future periods to forecast
+# freq = frequency of the future periods ('H' for hourly)
+future = m.make_future_dataframe(periods=365*24, freq='H')
+
+# All that is left to do is to generate the forecast using the predict method
+# and now we have a forecasting model in only four lines of code.
+forecast = m.predict(future)
+
+# print out the forecasting table. It contains a lot of information of which we are
+# interested in only the four values.
+forecast.tail()
+
+# Display the last 24 hours of the forecast (adjust the number in tail() to see more or less)
+forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(24)
+
+# Now join test and forecast together, to create a single DataFrame holding both the actual and predicted values
+
+# Merge forecast into the test data based on the 'ds' column
+test = test.merge(forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']], on='ds', how='left')
+
+test.head()
+
+# last year of the training set is repeated as the forecast for next year.
+#test['baseline'] = train['H'][-365*24:].values
+#test.head()
+
+#from sklearn.metrics import mean_absolute_error
+
+#prophet_mae = mean_absolute_error(test['y'], test['yhat'])
+#baseline_mae = mean_absolute_error(test['y'], test['baseline'])
+
+#print(prophet_mae)
+#print(baseline_mae)
+
+# Create a baseline by repeating the precipitation from the same hour and day of the year from the training data (seasonal naive baseline)
+# This involves shifting the training data by one year and merging it with the test data.
+
+# Create a copy of the training data with 'ds' shifted by one year
+baseline_df = train[['ds', 'y']].copy()
+baseline_df['ds'] = baseline_df['ds'] + pd.Timedelta(days=365) # Shift by one year (approx, consider leap years if necessary)
+baseline_df = baseline_df.rename(columns={'y': 'baseline'})
+
+# Drop existing 'baseline' and 'baseline_x' columns from test if they exist to avoid merge conflicts
+test = test.drop(columns=['baseline', 'baseline_x'], errors='ignore')
+
+# Merge the shifted baseline data into the test set based on 'ds'
+# Use a left merge to keep all test dates and add baseline where available
+test = test.merge(baseline_df, on='ds', how='left')
+
+test.head()
+
+import numpy as np
+from scipy.stats import pearsonr
+from sklearn.metrics import mean_absolute_error
+import pandas as pd # Import pandas for dropna
+
+def calculate_nse(y_true, y_pred):
+    """Calculates the Nash-Sutcliffe Efficiency (NSE)."""
+    # Drop rows where either true or predicted values are NaN for metric calculation
+    combined = pd.DataFrame({'y_true': y_true, 'y_pred': y_pred}).dropna()
+    y_true = combined['y_true']
+    y_pred = combined['y_pred']
+
+    if y_true.empty:
+        return np.nan # Cannot calculate if no valid data points
+
+    numerator = np.sum((y_true - y_pred)**2)
+    denominator = np.sum((y_true - np.mean(y_true))**2)
+
+    # Avoid division by zero if actual values are constant
+    if denominator == 0:
+        return np.nan if numerator != 0 else 1.0
+    return 1 - (numerator / denominator)
+
+def calculate_kge(y_true, y_pred):
+    """Calculates the Kling-Gupta Efficiency (KGE)."""
+    # Drop rows where either true or predicted values are NaN for metric calculation
+    combined = pd.DataFrame({'y_true': y_true, 'y_pred': y_pred}).dropna()
+    y_true = combined['y_true']
+    y_pred = combined['y_pred']
+
+    if y_true.empty:
+         return np.nan # Cannot calculate if no valid data points
+
+    # Handle potential division by zero or zero standard deviation
+    std_true = np.std(y_true)
+    std_pred = np.std(y_pred)
+
+    # Calculate correlation only on non-NaN pairs
+    r = np.nan
+    if std_true != 0 and std_pred != 0:
+        try:
+             r, _ = pearsonr(y_true, y_pred)
+        except ValueError:
+             # Handles cases where y_true or y_pred might have constant values after dropping NaNs
+             r = np.nan
+
+
+    alpha = std_pred / std_true if std_true != 0 else np.nan # Ratio of standard deviations
+    beta = np.mean(y_pred) / np.mean(y_true) if np.mean(y_true) != 0 else np.nan # Ratio of means
+
+    # Handle cases where r, alpha, or beta are NaN
+    if np.isnan(r) or np.isnan(alpha) or np.isnan(beta):
+        return np.nan
+
+    return 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+
+
+def calculate_pearson_correlation(y_true, y_pred):
+    """Calculates the Pearson correlation coefficient."""
+    # Drop rows where either true or predicted values are NaN for metric calculation
+    combined = pd.DataFrame({'y_true': y_true, 'y_pred': y_pred}).dropna()
+    y_true = combined['y_true']
+    y_pred = combined['y_pred']
+
+    if y_true.empty:
+         return np.nan # Cannot calculate if no valid data points
+
+    # Handle cases with constant data or NaNs
+    if np.std(y_true) == 0 or np.std(y_pred) == 0:
+        return np.nan
+    try:
+        r, _ = pearsonr(y_true, y_pred)
+        return r
+    except ValueError:
+        # Handles cases where y_true or y_pred might have constant values after dropping NaNs
+        return np.nan
+
+
+def calculate_bias(y_true, y_pred):
+    """Calculates the Bias."""
+    # Drop rows where either true or predicted values are NaN for metric calculation
+    combined = pd.DataFrame({'y_true': y_true, 'y_pred': y_pred}).dropna()
+    y_true = combined['y_true']
+    y_pred = combined['y_pred']
+
+    if y_true.empty:
+         return np.nan # Cannot calculate if no valid data points
+
+    return np.mean(y_pred - y_true)
+
+# Ensure the data used for metrics does not contain NaNs by dropping rows with NaNs in the relevant columns
+# Use the correct column names based on the merges ('yhat' and 'baseline')
+data_for_metrics = test.dropna(subset=['y', 'yhat', 'baseline']).copy()
+
+# Calculate metrics for Prophet
+prophet_mae = mean_absolute_error(data_for_metrics['y'], data_for_metrics['yhat'])
+prophet_nse = calculate_nse(data_for_metrics['y'], data_for_metrics['yhat'])
+prophet_kge = calculate_kge(data_for_metrics['y'], data_for_metrics['yhat'])
+prophet_pearson = calculate_pearson_correlation(data_for_metrics['y'], data_for_metrics['yhat'])
+prophet_bias = calculate_bias(data_for_metrics['y'], data_for_metrics['yhat'])
+
+# Calculate metrics for Baseline
+baseline_mae = mean_absolute_error(data_for_metrics['y'], data_for_metrics['baseline'])
+baseline_nse = calculate_nse(data_for_metrics['y'], data_for_metrics['baseline'])
+baseline_kge = calculate_kge(data_for_metrics['y'], data_for_metrics['baseline'])
+baseline_pearson = calculate_pearson_correlation(data_for_metrics['y'], data_for_metrics['baseline'])
+baseline_bias = calculate_bias(data_for_metrics['y'], data_for_metrics['baseline'])
+
+print("Prophet Metrics:")
+print(f"  MAE: {prophet_mae}")
+print(f"  NSE: {prophet_nse}")
+print(f"  KGE: {prophet_kge}")
+print(f"  Pearson Correlation: {prophet_pearson}")
+print(f"  Bias: {prophet_bias}")
+print("\nBaseline Metrics:")
+print(f"  MAE: {baseline_mae}")
+print(f"  NSE: {baseline_nse}")
+print(f"  KGE: {baseline_kge}")
+print(f"  Pearson Correlation: {baseline_pearson}")
+print(f"  Bias: {baseline_bias}")
+
+fig, ax = plt.subplots()
+
+ax.plot(train['ds'], train['y'], label='Train') # Changed to plot train['y'] against train['ds']
+ax.plot(test['ds'], test['y'], 'b-', label='Actual')
+ax.plot(test['ds'], test['yhat'], color='darkorange', ls='--', lw=3, label='Predictions')
+ax.plot(test['ds'], test['baseline'], 'k:', label='Baseline')
+
+ax.set_xlabel('Date')
+ax.set_ylabel('Precipitation (mm)') # Updated label to reflect data
+
+# You can still add a highlighted area if needed for the test period, using datetime objects
+# For example:
+# start_test_highlight = test['ds'].min()
+# end_test_highlight = test['ds'].max()
+# ax.axvspan(start_test_highlight, end_test_highlight, color='#808080', alpha=0.1)
+
+
+ax.legend(loc='best')
+
+# Removed hardcoded xticks and xlim - matplotlib will handle datetime
+# plt.xticks(
+#     [3224, 3254, 3285, 3316, 3344, 3375, 3405, 3436, 3466, 3497, 3528, 3558, 3589, 3619],
+#     ['Nov', 'Dec', 'Jan 1990', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'])
+# plt.xlim(3200, 3649)
+
+plt.fill_between(x=test['ds'], y1=test['yhat_lower'], y2=test['yhat_upper'], color='lightblue', alpha=0.5) # Use 'ds' for x-axis with datetime objects
+
+
+fig.autofmt_xdate()
+plt.tight_layout()
+
+fig, ax = plt.subplots()
+
+# Plot only the test set, predictions, and baseline
+ax.plot(test['ds'], test['y'], 'b-', label='Actual')
+ax.plot(test['ds'], test['yhat'], color='darkorange', ls='--', lw=3, label='Predictions')
+ax.plot(test['ds'], test['baseline'], 'k:', label='Baseline')
+
+ax.set_xlabel('Date')
+ax.set_ylabel('Precipitation (mm)') # Updated label to reflect data
+
+# Optional: Add a highlighted area if needed for a specific period within the test set
+# start_highlight = pd.to_datetime('YYYY-MM-DD HH:MM:SS') # Replace with your start date
+# end_highlight = pd.to_datetime('YYYY-MM-DD HH:MM:SS')   # Replace with your end date
+# ax.axvspan(start_highlight, end_highlight, color='#808080', alpha=0.1)
+
+ax.legend(loc='best')
+
+# Fill between the confidence interval, using 'ds' for the x-axis
+plt.fill_between(x=test['ds'], y1=test['yhat_lower'], y2=test['yhat_upper'], color='lightblue', alpha=0.5)
+
+fig.autofmt_xdate()
+plt.tight_layout()
+
+fig1 = m.plot(forecast)
+
+fig2 = m.plot_components(forecast)
+
+fig2 = m.plot_components(forecast)
+fig2.savefig(f'{OUT_DIR}/3_prophet_2components.png')
+
+from prophet.plot import add_changepoints_to_plot
+
+fig3 = m.plot(forecast)
+a = add_changepoints_to_plot(fig3.gca(), m, forecast)
+
+fig3.savefig(f'{OUT_DIR}/3_prophet_3change_points.png')
+
+from prophet.plot import plot_yearly, plot_weekly
+
+fig4 = plot_yearly(m)
+
+fig4.savefig(f'{OUT_DIR}/3_prophet_4yearly.png')
+
+fig5 = plot_weekly(m)
+
+fig5.savefig(f'{OUT_DIR}/3_prophet_5weekly.png')
+
+m2 = Prophet(yearly_seasonality=20).fit(train)
+
+fig6 = plot_yearly(m2)
+
+fig6.savefig(f'{OUT_DIR}/3_prophet_6yearly_seasonality.png')
+
+from prophet.diagnostics import cross_validation
+# from tqdm import tqdm # Import tqdm
+
+# parameter settings (see above) : m is our model from above
+# Removed tqdm wrapper causing AttributeError
+df_xval = cross_validation(m, initial='8640 hours', period='4320 hours', horizon='4320 hours', parallel='processes')
+
+df_xval.head()
+
+from prophet.diagnostics import performance_metrics
+
+df_xval_perf = performance_metrics(df_xval, rolling_window=0)
+
+df_xval_perf.head()
+
+from prophet.plot import plot_cross_validation_metric
+
+fig7 = plot_cross_validation_metric(df_xval, metric='mae')
+
+"""Hyperparameter tunning"""
+
+from itertools import product
+from prophet import Prophet
+from prophet.diagnostics import cross_validation, performance_metrics
+
+param_grid = {
+    'changepoint_prior_scale': [0.001, 0.01, 0.1, 0.5, 1.0], # Expanded range
+    'seasonality_prior_scale': [0.01, 0.1, 1.0, 10.0, 20.0], # Expanded range
+    'seasonality_mode': ['additive', 'multiplicative'] # Added seasonality_mode
+}
+
+all_params = [dict(zip(param_grid.keys(), v)) for v in product(*param_grid.values())]
+
+maes = []
+
+# Optional: Use tqdm to track progress if tuning takes a long time
+# from tqdm import tqdm
+# for params in tqdm(all_params):
+
+for params in all_params:
+    # Handle seasonality_mode if it's in params
+    model_params = params.copy()
+    seasonality_mode = model_params.pop('seasonality_mode', 'additive') # Default to additive if not in params
+
+    m = Prophet(**model_params, seasonality_mode=seasonality_mode).fit(train)
+    # Use hourly units for cross-validation parameters
+    df_xval = cross_validation(m, initial='8640 hours', period='4320 hours', horizon='4320 hours', parallel='processes')
+    # Calculate performance metrics with a rolling window of 24 hours (1 day)
+    df_xval_perf = performance_metrics(df_xval, rolling_window=24)
+    # We are interested in the MAE for the full horizon, which is the last row when rolling_window > 0
+    maes.append(df_xval_perf['mae'].values[-1])
+
+tuning_results = pd.DataFrame(all_params)
+tuning_results['mae'] = maes
+
+tuning_results
+
+# take the minimum mae and print out the corresponding parameters
+best_params = all_params[np.argmin(maes)]
+print(best_params)
+#{'changepoint_prior_scale': 0.001, 'seasonality_prior_scale': 0.1, 'seasonality_mode': 'additive'}
+
+#
+best_params = {'changepoint_prior_scale': 0.001, 'seasonality_prior_scale': 0.1, 'seasonality_mode': 'additive'}
+
+# Separate seasonality_mode from best_params
+#GG seasonality_mode = best_params.pop('seasonality_mode', 'additive')
+
+# Initialize Prophet with the remaining parameters
+m = Prophet(**best_params)
+
+# Add yearly seasonality with the determined seasonality_mode
+#GG m.add_seasonality(name='yearly', period=365.25, fourier_order=20, mode=seasonality_mode)
+
+# m.add_country_holidays(country_name='US') # Removed US holidays - change 'US' to your country code or remove if not needed
+m.fit(train);
+
+future = m.make_future_dataframe(periods=4320, freq='H')
+
+forecast = m.predict(future)
+forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(24)
+
+test[['yhat', 'yhat_lower', 'yhat_upper']] = forecast[['yhat', 'yhat_lower', 'yhat_upper']]
+test.head()
+#display(test.head())
+
+
+
+fig, ax = plt.subplots()
+
+# Plot only the test set, predictions, and baseline
+ax.plot(test['ds'], test['y'], 'b-', label='Actual')
+ax.plot(test['ds'], test['yhat'], color='darkorange', ls='--', lw=3, label='Predictions')
+ax.plot(test['ds'], test['baseline'], 'k:', label='Baseline')
+
+ax.set_xlabel('Date')
+ax.set_ylabel('Precipitation (mm)') # Updated label to reflect data
+
+# Removed hardcoded axvspan, xticks, and xlim as they are not suitable for hourly data and datetime axis
+# ax.axvspan(204, 215, color='#808080', alpha=0.1)
+# plt.xticks(np.arange(0, 215, 12), np.arange(2004, 2022, 1))
+# plt.xlim(180, 215)
+
+ax.legend(loc='best')
+
+# Fill between the confidence interval, using 'ds' for the x-axis
+plt.fill_between(x=test['ds'], y1=test['yhat_lower'], y2=test['yhat_upper'], color='lightblue', alpha=0.5)
+
+
+fig.autofmt_xdate()
+plt.tight_layout()
+
+prophet_components_fig = m.plot_components(forecast)
+
+#fig.savefig(f'{OUT_DIR}/3_prophet_9BP_components.png')
+
+import numpy as np
+from scipy.stats import pearsonr
+
+def calculate_nse(y_true, y_pred):
+    """Calculates the Nash-Sutcliffe Efficiency (NSE)."""
+    numerator = np.sum((y_true - y_pred)**2)
+    denominator = np.sum((y_true - np.mean(y_true))**2)
+    # Avoid division by zero if actual values are constant
+    if denominator == 0:
+        return np.nan if numerator != 0 else 1.0
+    return 1 - (numerator / denominator)
+
+def calculate_kge(y_true, y_pred):
+    """Calculates the Kling-Gupta Efficiency (KGE)."""
+    # Handle potential division by zero or zero standard deviation
+    std_true = np.std(y_true)
+    std_pred = np.std(y_pred)
+    if std_true == 0 or std_pred == 0:
+        r = np.nan # Cannot calculate correlation
+    else:
+        r, _ = pearsonr(y_true, y_pred)
+
+    alpha = std_pred / std_true if std_true != 0 else np.nan # Ratio of standard deviations
+    beta = np.mean(y_pred) / np.mean(y_true) if np.mean(y_true) != 0 else np.nan # Ratio of means
+
+    # Handle cases where r, alpha, or beta are NaN
+    if np.isnan(r) or np.isnan(alpha) or np.isnan(beta):
+        return np.nan
+
+    return 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+
+def calculate_pearson_correlation(y_true, y_pred):
+    """Calculates the Pearson correlation coefficient."""
+    # Handle cases with constant data or NaNs
+    if np.std(y_true) == 0 or np.std(y_pred) == 0:
+        return np.nan
+    r, _ = pearsonr(y_true, y_pred)
+    return r
+
+def calculate_bias(y_true, y_pred):
+    """Calculates the Bias."""
+    return np.mean(y_pred - y_true)
+
+# Ensure the data used for metrics does not contain NaNs
+# Using test_filled from the previous MAE calculation cell
+# test_filled = test.copy().fillna(0) # Assuming NaNs were filled with 0 previously
+
+# If you prefer to drop NaNs, use this instead:
+test_cleaned = test.dropna(subset=['y', 'yhat', 'baseline']) # Assuming 'yhat' and 'baseline' are the correct column names after merges
+
+# Choose which DataFrame to use for metrics calculation (test_filled or test_cleaned)
+# Let's use test_cleaned to avoid the assumption of filling NaNs with 0 for all metrics
+data_for_metrics = test_cleaned.copy()
+
+# Calculate metrics for Prophet
+prophet_nse = calculate_nse(data_for_metrics['y'], data_for_metrics['yhat'])
+prophet_kge = calculate_kge(data_for_metrics['y'], data_for_metrics['yhat'])
+prophet_pearson = calculate_pearson_correlation(data_for_metrics['y'], data_for_metrics['yhat'])
+prophet_bias = calculate_bias(data_for_metrics['y'], data_for_metrics['yhat'])
+
+# Calculate metrics for Baseline
+baseline_nse = calculate_nse(data_for_metrics['y'], data_for_metrics['baseline'])
+baseline_kge = calculate_kge(data_for_metrics['y'], data_for_metrics['baseline'])
+baseline_pearson = calculate_pearson_correlation(data_for_metrics['y'], data_for_metrics['baseline'])
+baseline_bias = calculate_bias(data_for_metrics['y'], data_for_metrics['baseline'])
+
+print("Prophet Metrics:")
+print(f"  NSE: {prophet_nse}")
+print(f"  KGE: {prophet_kge}")
+print(f"  Pearson Correlation: {prophet_pearson}")
+print(f"  Bias: {prophet_bias}")
+print("\nBaseline Metrics:")
+print(f"  NSE: {baseline_nse}")
+print(f"  KGE: {baseline_kge}")
+print(f"  Pearson Correlation: {baseline_pearson}")
+print(f"  Bias: {baseline_bias}")
+
